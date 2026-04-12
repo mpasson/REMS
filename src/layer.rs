@@ -79,6 +79,11 @@ impl Layer {
             d,
         }
     }
+
+    /// Convenience constructor for Rust code that takes a complex index.
+    pub fn from_complex(n: Complex<f64>, d: f64) -> Layer {
+        Layer { n, d }
+    }
 }
 
 /// Extract a `Complex<f64>` from a Python object that is either a `float` or a

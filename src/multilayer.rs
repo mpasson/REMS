@@ -14,6 +14,7 @@ use std::ops::{Add, Mul, Sub};
 
 use crate::enums::BackEnd;
 use crate::enums::BoundaryCondition;
+use crate::enums::Normalization;
 use crate::enums::Polarization;
 use crate::layer::{Layer, LayerCoefficientVector, PEC};
 use crate::scattering_matrix::calculate_s_matrix;
@@ -24,6 +25,7 @@ use crate::transfer_matrix::{
 };
 use cumsum::cumsum;
 use find_peaks::PeakFinder;
+use log::warn;
 use num_complex::Complex;
 
 /// Vacuum impedance.
@@ -149,9 +151,37 @@ impl FieldData {
     }
 
     /// Normalizes the field data so that the absolute value of z component of the Poynting vector is 1.
-    pub fn normalize(self) -> FieldData {
+    pub fn normalize_power(self) -> FieldData {
         let poynting_vector = self.get_poyinting_vector();
         let norm = poynting_vector.sqrt();
+        let ex = self.Ex.into_iter().map(|x| x / norm).collect();
+        let ey = self.Ey.into_iter().map(|x| x / norm).collect();
+        let ez = self.Ez.into_iter().map(|x| x / norm).collect();
+        let hx = self.Hx.into_iter().map(|x| x / norm).collect();
+        let hy = self.Hy.into_iter().map(|x| x / norm).collect();
+        let hz = self.Hz.into_iter().map(|x| x / norm).collect();
+        FieldData {
+            x: self.x,
+            Ex: ex,
+            Ey: ey,
+            Ez: ez,
+            Hx: hx,
+            Hy: hy,
+            Hz: hz,
+        }
+    }
+
+    /// Normalizes the field so that the maximum total electric field amplitude is 1.
+    /// max(sqrt(|Ex|² + |Ey|² + |Ez|²)) = 1
+    pub fn normalize_max_field(self) -> FieldData {
+        let max_e = self
+            .Ex
+            .iter()
+            .zip(self.Ey.iter())
+            .zip(self.Ez.iter())
+            .map(|((&ex, &ey), &ez)| (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt())
+            .fold(0.0_f64, f64::max);
+        let norm = if max_e < 1e-300 { 1.0 } else { max_e };
         let ex = self.Ex.into_iter().map(|x| x / norm).collect();
         let ey = self.Ey.into_iter().map(|x| x / norm).collect();
         let ez = self.Ez.into_iter().map(|x| x / norm).collect();
@@ -191,7 +221,7 @@ pub struct IndexData {
 /// * `a` - The modal coefficient of the forward propagating wave.
 /// * `b` - The modal coefficient of the backward propagating wave.
 /// * `k0` - The vacuum wavevector (real).
-/// * `k`  - The parallel wavevector (real, as used in field reconstruction).
+/// * `k`  - The parallel wavevector (complex, supports both real and complex neff).
 /// * `n`  - The complex index of refraction.
 /// * `x`  - The x coordinates inside the layer.
 /// # Returns
@@ -200,14 +230,13 @@ fn get_field_slice(
     a: Complex<f64>,
     b: Complex<f64>,
     k0: f64,
-    k: f64,
+    k: Complex<f64>,
     n: Complex<f64>,
     x: Vec<f64>,
 ) -> Vec<Complex<f64>> {
     use crate::transfer_matrix::kz_physical;
     let k0c = Complex::new(k0, 0.0);
-    let kc = Complex::new(k, 0.0);
-    let beta = kz_physical(k0c, n, kc);
+    let beta = kz_physical(k0c, n, k);
     x.iter()
         .map(|&xv| {
             let z = Complex::new(0.0, xv);
@@ -248,6 +277,9 @@ pub struct MultiLayer {
     left_bc: BoundaryCondition,
     /// Boundary condition on the right side of the structure.
     right_bc: BoundaryCondition,
+    /// Normalization convention used for field reconstruction.
+    #[pyo3(get)]
+    pub normalization: Normalization,
 }
 
 // ─── Python-facing methods ────────────────────────────────────────────────────
@@ -309,6 +341,7 @@ impl MultiLayer {
             plot_step: 1e-3,
             left_bc,
             right_bc,
+            normalization: Normalization::MaxField,
         };
         multilayer.set_backend(BackEnd::Transfer);
         Ok(multilayer)
@@ -453,6 +486,44 @@ impl MultiLayer {
             .map(|c| (c.re, c.im))
             .collect()
     }
+
+    /// Sets the normalization convention used for field reconstruction.
+    #[pyo3(name = "set_normalization")]
+    pub fn python_set_normalization(&mut self, norm: Normalization) {
+        self.normalization = norm;
+    }
+
+    /// Calculates the field profile for a mode with a given complex effective index.
+    ///
+    /// Unlike `field()`, which uses the real-axis solver to find neff internally,
+    /// this method accepts an explicit complex neff (as returned by `complex_neff`
+    /// or `all_complex_neff`) and reconstructs the field for that mode.
+    ///
+    /// For semi-infinite boundaries the outgoing wave in the rightmost layer is
+    /// **not** zeroed: for a complex neff the radiation condition is already encoded
+    /// in the imaginary part of neff, and zeroing the outgoing amplitude would give
+    /// a physically wrong result.
+    ///
+    /// # Arguments
+    /// * `omega`        - The angular frequency (real, same units as used for `neff`).
+    /// * `polarization` - The polarization of the mode.
+    /// * `neff_re`      - Real part of the complex effective index.
+    /// * `neff_im`      - Imaginary part of the complex effective index.
+    /// # Returns
+    /// A `FieldData` with all six field components on the standard plotting grid.
+    #[pyo3(name = "field_complex")]
+    #[pyo3(signature = (omega, polarization=None, neff_re=0.0, neff_im=0.0))]
+    pub fn python_field_complex(
+        &self,
+        omega: f64,
+        polarization: Option<Polarization>,
+        neff_re: f64,
+        neff_im: f64,
+    ) -> FieldData {
+        let polarization = polarization.unwrap_or(Polarization::TE);
+        let neff = Complex::new(neff_re, neff_im);
+        self.field_complex(omega, polarization, neff)
+    }
 }
 
 // ─── Internal Rust methods ────────────────────────────────────────────────────
@@ -468,6 +539,7 @@ impl MultiLayer {
             plot_step: 1e-3,
             left_bc: BoundaryCondition::SemiInfinite,
             right_bc: BoundaryCondition::SemiInfinite,
+            normalization: Normalization::MaxField,
         };
         multilayer.set_backend(BackEnd::Transfer);
         multilayer
@@ -1063,13 +1135,13 @@ impl MultiLayer {
     pub fn get_propagation_coefficients(
         &self,
         k0: f64,
-        k: f64,
+        k: Complex<f64>,
         polarization: Polarization,
         a: Complex<f64>,
         b: Complex<f64>,
     ) -> Vec<LayerCoefficientVector> {
         let k0c = Complex::new(k0, 0.0);
-        let kc = Complex::new(k, 0.0);
+        let kc = k;
         match self.backend {
             BackEnd::Transfer => match self.left_bc {
                 BoundaryCondition::PEC => {
@@ -1126,7 +1198,7 @@ impl MultiLayer {
         coefficient_vector: &[LayerCoefficientVector],
         grid_data: &GridData,
         k0: f64,
-        k: f64,
+        k: Complex<f64>,
     ) -> Vec<Complex<f64>> {
         let x = grid_data.xplot.clone();
 
@@ -1160,12 +1232,12 @@ impl MultiLayer {
     pub fn get_coefficient_all_components(
         &self,
         k0: f64,
-        k: f64,
+        k: Complex<f64>,
         main_coefficients: Vec<LayerCoefficientVector>,
     ) -> FullLayerCoefficientVector {
         let main1 = main_coefficients;
         let k0c = Complex::new(k0, 0.0);
-        let kc = Complex::new(k, 0.0);
+        let kc = k;
         let mut main2 = Vec::new();
         let mut main3 = Vec::new();
         let mut maink = Vec::new();
@@ -1215,8 +1287,13 @@ impl MultiLayer {
             BoundaryCondition::SemiInfinite => (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)),
             BoundaryCondition::PEC => (Complex::new(1.0, 0.0), Complex::new(-1.0, 0.0)),
         };
-        let mut coefficient_vector =
-            self.get_propagation_coefficients(k0, k0 * neff, polarization, init_a, init_b);
+        let mut coefficient_vector = self.get_propagation_coefficients(
+            k0,
+            Complex::new(k0 * neff, 0.0),
+            polarization,
+            init_a,
+            init_b,
+        );
         let grid_data = self.get_grid_data();
 
         match self.right_bc {
@@ -1230,16 +1307,23 @@ impl MultiLayer {
             BoundaryCondition::PEC => {}
         }
 
-        let coefficients = self.get_coefficient_all_components(k0, k0 * neff, coefficient_vector);
+        let coefficients = self.get_coefficient_all_components(
+            k0,
+            Complex::new(k0 * neff, 0.0),
+            coefficient_vector,
+        );
 
         let (main1, main2, main3, maink, mainb, zeros) = coefficients;
-        let field1 = self.get_field_componet(&main1, &grid_data, k0, k0 * neff);
-        let fieldzeros = self.get_field_componet(&zeros, &grid_data, k0, k0 * neff);
+        let field1 = self.get_field_componet(&main1, &grid_data, k0, Complex::new(k0 * neff, 0.0));
+        let fieldzeros =
+            self.get_field_componet(&zeros, &grid_data, k0, Complex::new(k0 * neff, 0.0));
 
         let field_data = match polarization {
             Polarization::TE => {
-                let fieldk = self.get_field_componet(&maink, &grid_data, k0, k0 * neff);
-                let fieldb = self.get_field_componet(&mainb, &grid_data, k0, k0 * neff);
+                let fieldk =
+                    self.get_field_componet(&maink, &grid_data, k0, Complex::new(k0 * neff, 0.0));
+                let fieldb =
+                    self.get_field_componet(&mainb, &grid_data, k0, Complex::new(k0 * neff, 0.0));
 
                 FieldData {
                     x: grid_data.xplot.clone(),
@@ -1252,8 +1336,10 @@ impl MultiLayer {
                 }
             }
             Polarization::TM => {
-                let field2 = self.get_field_componet(&main2, &grid_data, k0, k0 * neff);
-                let field3 = self.get_field_componet(&main3, &grid_data, k0, k0 * neff);
+                let field2 =
+                    self.get_field_componet(&main2, &grid_data, k0, Complex::new(k0 * neff, 0.0));
+                let field3 =
+                    self.get_field_componet(&main3, &grid_data, k0, Complex::new(k0 * neff, 0.0));
                 FieldData {
                     x: grid_data.xplot.clone(),
                     Ex: field2,
@@ -1266,7 +1352,98 @@ impl MultiLayer {
             }
         };
 
-        Ok(field_data.normalize())
+        Ok(match self.normalization {
+            Normalization::MaxField => field_data.normalize_max_field(),
+            Normalization::Power => field_data.normalize_power(),
+        })
+    }
+
+    // ── Complex-neff field reconstruction ────────────────────────────────────
+
+    /// Reconstructs the field for a mode specified by a complex effective index.
+    ///
+    /// For semi-infinite boundaries the outgoing wave amplitude in the rightmost
+    /// layer is **not** forced to zero, because the complex neff already encodes
+    /// the correct radiation or decay condition.
+    ///
+    /// Normalization follows `self.normalization`. If `Normalization::Power` is
+    /// requested but neff has a nonzero imaginary part, a warning is emitted
+    /// and `MaxField` normalization is used instead.
+    pub fn field_complex(
+        &self,
+        k0: f64,
+        polarization: Polarization,
+        neff: Complex<f64>,
+    ) -> FieldData {
+        let k = neff * k0;
+
+        let (init_a, init_b) = match self.left_bc {
+            BoundaryCondition::SemiInfinite => (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)),
+            BoundaryCondition::PEC => (Complex::new(1.0, 0.0), Complex::new(-1.0, 0.0)),
+        };
+
+        let coefficient_vector =
+            self.get_propagation_coefficients(k0, k, polarization, init_a, init_b);
+        let grid_data = self.get_grid_data();
+
+        // NOTE: for complex neff we do NOT zero the outgoing amplitude in the
+        // last layer. The correct boundary behaviour is encoded in Im(neff).
+
+        let coefficients = self.get_coefficient_all_components(k0, k, coefficient_vector);
+        let (main1, main2, main3, maink, mainb, zeros) = coefficients;
+        let field1 = self.get_field_componet(&main1, &grid_data, k0, k);
+        let fieldzeros = self.get_field_componet(&zeros, &grid_data, k0, k);
+
+        let field_data = match polarization {
+            Polarization::TE => {
+                let fieldk = self.get_field_componet(&maink, &grid_data, k0, k);
+                let fieldb = self.get_field_componet(&mainb, &grid_data, k0, k);
+                FieldData {
+                    x: grid_data.xplot.clone(),
+                    Ex: fieldzeros.clone(),
+                    Ey: field1,
+                    Ez: fieldzeros.clone(),
+                    Hx: fieldb.iter().map(|x| x / Z0).collect(),
+                    Hy: fieldzeros.clone(),
+                    Hz: fieldk.iter().map(|x| x / Z0).collect(),
+                }
+            }
+            Polarization::TM => {
+                let field2 = self.get_field_componet(&main2, &grid_data, k0, k);
+                let field3 = self.get_field_componet(&main3, &grid_data, k0, k);
+                FieldData {
+                    x: grid_data.xplot.clone(),
+                    Ex: field2,
+                    Ey: fieldzeros.clone(),
+                    Ez: field1,
+                    Hx: fieldzeros.clone(),
+                    Hy: field3.iter().map(|x| x / Z0).collect(),
+                    Hz: fieldzeros.clone(),
+                }
+            }
+        };
+
+        // Normalization dispatch with warning for Power + complex neff.
+        let use_normalization = if neff.im != 0.0 {
+            match self.normalization {
+                Normalization::Power => {
+                    warn!(
+                        "Power normalization is not valid for complex neff (neff = {:.6} + {:.6}i). \
+                         Falling back to MaxField normalization.",
+                        neff.re, neff.im
+                    );
+                    Normalization::MaxField
+                }
+                other => other,
+            }
+        } else {
+            self.normalization
+        };
+
+        match use_normalization {
+            Normalization::MaxField => field_data.normalize_max_field(),
+            Normalization::Power => field_data.normalize_power(),
+        }
     }
 
     // ── Index profile ─────────────────────────────────────────────────────────
@@ -1512,8 +1689,45 @@ mod tests {
         let slab = create_slab_multilayer();
         let om = 2.0 * PI / 1.55;
         let field = slab.field(om, Polarization::TE, 0).unwrap();
-        let poynting = field.get_poyinting_vector();
-        assert!((poynting.norm() - 1.0).abs() < 1e-6, "Field not normalised");
+        let max_e = field
+            .Ex
+            .iter()
+            .zip(field.Ey.iter())
+            .zip(field.Ez.iter())
+            .map(|((&ex, &ey), &ez)| (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (max_e - 1.0).abs() < 1e-6,
+            "Max E field not normalised to 1, got {max_e}"
+        );
+    }
+
+    #[test]
+    fn test_field_complex_lossy_max_field_normalization() {
+        // Lossy core slab: core index has a small imaginary part.
+        let slab = MultiLayer::new(vec![
+            Layer::from_complex(Complex::new(1.0, 0.0), 1.0),
+            Layer::from_complex(Complex::new(2.0, -0.01), 0.6),
+            Layer::from_complex(Complex::new(1.0, 0.0), 1.0),
+        ]);
+        let om = 2.0 * PI / 1.55;
+        // Find the complex neff.
+        let roots = slab.solve_complex(om, Polarization::TE, (1.0, 2.0), (-0.05, 0.05));
+        assert!(!roots.is_empty(), "No complex mode found");
+        let neff = roots[0];
+        let field = slab.field_complex(om, Polarization::TE, neff);
+        // Check MaxField normalization: max total |E| == 1.
+        let max_e = field
+            .Ex
+            .iter()
+            .zip(field.Ey.iter())
+            .zip(field.Ez.iter())
+            .map(|((&ex, &ey), &ez)| (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (max_e - 1.0).abs() < 1e-6,
+            "Max E not normalised to 1, got {max_e}"
+        );
     }
 
     fn create_pec_left_half_slab() -> MultiLayer {
