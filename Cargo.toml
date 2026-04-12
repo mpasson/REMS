@@ -21,6 +21,8 @@ num-complex = "0.4.6"
 itertools = "0.14.0"
 iter_num_tools = "0.7.1"
 pyo3 = { version = "0.24.2", features = ["num-complex", "extension-module", "generate-import-lib"] }
+log = "0.4"
+pyo3-log = "0.12"
 cumsum = "1.0.0"
 toml = "0.8.19"
 serde = { version = "1.0.213", features = ["derive"] }

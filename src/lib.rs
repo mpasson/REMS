@@ -8,14 +8,16 @@ pub mod multilayer;
 pub mod scattering_matrix;
 pub mod transfer_matrix;
 
-use enums::{BackEnd, BoundaryCondition, Polarization};
+use enums::{BackEnd, BoundaryCondition, Normalization, Polarization};
 use layer::{Layer, PEC};
 use multilayer::{FieldData, IndexData, MultiLayer};
 
 #[pymodule]
 fn remsol(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    pyo3_log::init();
     m.add_class::<BackEnd>()?;
     m.add_class::<Polarization>()?;
+    m.add_class::<Normalization>()?;
     m.add_class::<Layer>()?;
     m.add_class::<MultiLayer>()?;
     m.add_class::<IndexData>()?;
