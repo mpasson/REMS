@@ -59,10 +59,16 @@ running Python tests or using the Python API:**
 
 ```bash
 uv run maturin develop --uv
+uv sync --reinstall-package remsol
 ```
 
-Forgetting this step is the most common source of confusion — Python will silently use
-the old compiled extension.
+Both commands are required. `maturin develop --uv` compiles the Rust code and installs
+the new wheel, but `uv` may restore a cached version of the old package on the next
+`uv run`. Running `uv sync --reinstall-package remsol` forces `uv` to pick up the
+freshly built extension from the local source tree.
+
+Forgetting one or both steps is the most common source of confusion — Python will
+silently use the old compiled extension.
 
 ---
 
@@ -71,6 +77,7 @@ the old compiled extension.
 ```bash
 # Rebuild Python extension (required after any .rs change)
 uv run maturin develop --uv
+uv sync --reinstall-package remsol
 
 # Run Rust unit tests (no Python needed)
 cargo test --lib
