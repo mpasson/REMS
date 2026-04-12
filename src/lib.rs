@@ -1,4 +1,4 @@
-//!Rust module for culcuation of electromagnetic modes in 1D multilayer structures.
+//!Rust module for calculation of electromagnetic modes in 1D multilayer structures.
 
 use pyo3::prelude::*;
 
@@ -8,9 +8,9 @@ pub mod multilayer;
 pub mod scattering_matrix;
 pub mod transfer_matrix;
 
-use enums::*;
-use layer::*;
-use multilayer::*;
+use enums::{BackEnd, BoundaryCondition, Polarization};
+use layer::{Layer, PEC};
+use multilayer::{FieldData, IndexData, MultiLayer};
 
 #[pymodule]
 fn remsol(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -19,7 +19,7 @@ fn remsol(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Layer>()?;
     m.add_class::<MultiLayer>()?;
     m.add_class::<IndexData>()?;
-    // m.add_class::<PythonFieldData>()?;
+    m.add_class::<FieldData>()?;
     m.add_class::<BoundaryCondition>()?;
     m.add_class::<PEC>()?;
     Ok(())
