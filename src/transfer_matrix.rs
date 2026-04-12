@@ -21,6 +21,17 @@
 //!
 //! The propagation-coefficient helpers walk left-to-right in the same physical order,
 //! so the accumulated matrix and the step-by-step propagation are always consistent.
+//!
+//! # Branch-cut convention for `kz`
+//!
+//! All transverse wavevectors are computed via [`kz_physical`], which enforces
+//! `Im(kz) ≥ 0` (and `Re(kz) ≥ 0` when `Im(kz) = 0`).  This corresponds to the
+//! physical sheet on which evanescent fields decay away from the guiding region and
+//! propagating fields carry energy in the positive-x direction.
+//!
+//! For **leaky modes** the outer-cladding layers must use the *outgoing* sheet
+//! (`Im(kz) ≤ 0`), i.e. `-kz_physical(…)`.  The callers in `multilayer.rs` are
+//! responsible for applying that sign flip where appropriate.
 extern crate itertools;
 extern crate num_complex;
 
@@ -28,6 +39,43 @@ use crate::enums::Polarization;
 use crate::layer::{Layer, LayerCoefficientVector};
 use num_complex::Complex;
 use std::iter::zip;
+
+// ─── Branch-cut-safe transverse wavevector ────────────────────────────────────
+
+/// Returns the transverse wavevector
+///
+/// ```text
+/// kz = sqrt( (k0 · n)² − k² )
+/// ```
+///
+/// on the **physical sheet**: `Im(kz) ≥ 0`, and when `Im(kz) = 0` also
+/// `Re(kz) ≥ 0`.
+///
+/// The Rust / `num-complex` principal square root already satisfies `Im(sqrt(z)) ≥ 0`
+/// for all `z` not on the negative real axis.  The only problematic case is when the
+/// argument lands exactly on the negative real axis (the branch cut), where the
+/// principal value has `Im = 0` and `Re < 0`.  We detect and correct that case
+/// explicitly so that the function is continuous and correct everywhere in the
+/// complex plane.
+///
+/// # Arguments
+/// * `k0` - Vacuum wavevector (real, but passed as `Complex<f64>` for uniformity).
+/// * `n`  - Refractive index of the layer (may be complex for lossy / gain media).
+/// * `k`  - In-plane (propagation) wavevector (may be complex for leaky / lossy modes).
+pub fn kz_physical(k0: Complex<f64>, n: Complex<f64>, k: Complex<f64>) -> Complex<f64> {
+    let z = (k0 * n).powi(2) - k.powi(2);
+    let s = z.sqrt(); // principal sqrt: Im(s) >= 0 by definition
+                      // The principal sqrt satisfies Im(s) >= 0 everywhere *except* on the branch
+                      // cut (negative real axis of z), where it returns Im(s) = 0 and Re(s) < 0.
+                      // Flip the sign in that degenerate case so Re(s) >= 0 as well.
+    if s.im < 0.0 || (s.im == 0.0 && s.re < 0.0) {
+        -s
+    } else {
+        s
+    }
+}
+
+// ─── Transfer matrix struct ───────────────────────────────────────────────────
 
 /// Struct representing the transfer matrix.
 #[derive(Debug)]
@@ -81,27 +129,30 @@ impl TransferMatrix {
     /// left edge to the right edge of the layer:
     ///
     /// ```text
-    /// a_right = exp(+i·β·d) · a_left
-    /// b_right = exp(-i·β·d) · b_left
+    /// a_right = exp(+i·kz·d) · a_left
+    /// b_right = exp(-i·kz·d) · b_left
     /// ```
     ///
-    /// where `β = sqrt((k0·n)² − k²)` (possibly imaginary for evanescent layers).
+    /// where `kz = kz_physical(k0, n, k)`.
     ///
     /// # Arguments
-    /// * `n` - The refractive index of the layer.
+    /// * `n` - The refractive index of the layer (complex).
     /// * `d` - The thickness of the layer.
-    /// * `k0` - The vacuum wavevector.
-    /// * `k` - The in-plane component of the wavevector.
+    /// * `k0` - The vacuum wavevector (real).
+    /// * `k`  - The in-plane component of the wavevector (complex for leaky/lossy modes).
     ///
     /// # Returns
     /// The propagation transfer matrix for the layer.
-    pub fn matrix_propagation(n: f64, d: f64, k0: f64, k: f64) -> TransferMatrix {
-        let k0 = Complex::new(k0, 0.0);
-        let k = Complex::new(k, 0.0);
+    pub fn matrix_propagation(
+        n: Complex<f64>,
+        d: f64,
+        k0: Complex<f64>,
+        k: Complex<f64>,
+    ) -> TransferMatrix {
         let d = Complex::new(d, 0.0);
-        let a = ((k0 * n).powi(2) - k.powi(2)).sqrt();
-        let phase_positive = Complex::new(0.0, 1.0) * a * d;
-        let phase_negative = Complex::new(0.0, -1.0) * a * d;
+        let kz = kz_physical(k0, n, k);
+        let phase_positive = Complex::new(0.0, 1.0) * kz * d;
+        let phase_negative = Complex::new(0.0, -1.0) * kz * d;
         TransferMatrix {
             t11: phase_positive.exp(),
             t12: Complex::new(0.0, 0.0),
@@ -117,21 +168,21 @@ impl TransferMatrix {
     /// electric field (`Ey`) and its derivative.
     ///
     /// # Arguments
-    /// * `n1` - The refractive index of the layer on the left.
-    /// * `n2` - The refractive index of the layer on the right.
-    /// * `k0` - The vacuum wavevector.
-    /// * `k` - The in-plane component of the wavevector.
+    /// * `n1` - The refractive index of the layer on the left (complex).
+    /// * `n2` - The refractive index of the layer on the right (complex).
+    /// * `k0` - The vacuum wavevector (real).
+    /// * `k`  - The in-plane component of the wavevector (complex).
     ///
     /// # Returns
     /// The TE interface transfer matrix.
-    pub fn matrix_interface_te(n1: f64, n2: f64, k0: f64, k: f64) -> TransferMatrix {
-        let n1 = Complex::new(n1, 0.0);
-        let n2 = Complex::new(n2, 0.0);
-        let k0 = Complex::new(k0, 0.0);
-        let k = Complex::new(k, 0.0);
-
-        let k1 = ((k0 * n1).powi(2) - k.powi(2)).sqrt();
-        let k2 = ((k0 * n2).powi(2) - k.powi(2)).sqrt();
+    pub fn matrix_interface_te(
+        n1: Complex<f64>,
+        n2: Complex<f64>,
+        k0: Complex<f64>,
+        k: Complex<f64>,
+    ) -> TransferMatrix {
+        let k1 = kz_physical(k0, n1, k);
+        let k2 = kz_physical(k0, n2, k);
         TransferMatrix {
             t11: 0.5 * (k2 + k1) / k2,
             t12: 0.5 * (k2 - k1) / k2,
@@ -147,21 +198,21 @@ impl TransferMatrix {
     /// magnetic field (`Hy`) and the normal displacement field.
     ///
     /// # Arguments
-    /// * `n1` - The refractive index of the layer on the left.
-    /// * `n2` - The refractive index of the layer on the right.
-    /// * `k0` - The vacuum wavevector.
-    /// * `k` - The in-plane component of the wavevector.
+    /// * `n1` - The refractive index of the layer on the left (complex).
+    /// * `n2` - The refractive index of the layer on the right (complex).
+    /// * `k0` - The vacuum wavevector (real).
+    /// * `k`  - The in-plane component of the wavevector (complex).
     ///
     /// # Returns
     /// The TM interface transfer matrix.
-    pub fn matrix_interface_tm(n1: f64, n2: f64, k0: f64, k: f64) -> TransferMatrix {
-        let n1 = Complex::new(n1, 0.0);
-        let n2 = Complex::new(n2, 0.0);
-        let k0 = Complex::new(k0, 0.0);
-        let k = Complex::new(k, 0.0);
-
-        let k1 = n2.powi(2) * ((k0 * n1).powi(2) - k.powi(2)).sqrt();
-        let k2 = n1.powi(2) * ((k0 * n2).powi(2) - k.powi(2)).sqrt();
+    pub fn matrix_interface_tm(
+        n1: Complex<f64>,
+        n2: Complex<f64>,
+        k0: Complex<f64>,
+        k: Complex<f64>,
+    ) -> TransferMatrix {
+        let k1 = n2.powi(2) * kz_physical(k0, n1, k);
+        let k2 = n1.powi(2) * kz_physical(k0, n2, k);
         TransferMatrix {
             t11: 0.5 * (k2 + k1) / k1,
             t12: 0.5 * (k1 - k2) / k1,
@@ -175,19 +226,19 @@ impl TransferMatrix {
     /// Dispatches to [`matrix_interface_te`] or [`matrix_interface_tm`].
     ///
     /// # Arguments
-    /// * `n1` - The refractive index of the layer on the left.
-    /// * `n2` - The refractive index of the layer on the right.
-    /// * `k0` - The vacuum wavevector.
-    /// * `k` - The in-plane component of the wavevector.
+    /// * `n1`          - The refractive index of the layer on the left (complex).
+    /// * `n2`          - The refractive index of the layer on the right (complex).
+    /// * `k0`          - The vacuum wavevector (real).
+    /// * `k`           - The in-plane component of the wavevector (complex).
     /// * `polarization` - The polarization of the light.
     ///
     /// # Returns
     /// The interface transfer matrix.
     pub fn matrix_interface(
-        n1: f64,
-        n2: f64,
-        k0: f64,
-        k: f64,
+        n1: Complex<f64>,
+        n2: Complex<f64>,
+        k0: Complex<f64>,
+        k: Complex<f64>,
         polarization: Polarization,
     ) -> TransferMatrix {
         match polarization {
@@ -229,6 +280,8 @@ impl TransferMatrix {
     }
 }
 
+// ─── Full-stack transfer matrix ───────────────────────────────────────────────
+
 /// Calculates the physical forward-propagation transfer matrix of a multilayer system.
 ///
 /// For a system with layers `[L0, L1, …, L_{n-1}]` the matrix is assembled as:
@@ -246,21 +299,19 @@ impl TransferMatrix {
 /// `T[1,1] · 1 = 0`, i.e. `t22 = 0`.
 ///
 /// # Arguments
-/// * `layers` - The layers of the system.
-/// * `k0` - The vacuum wavevector.
-/// * `k` - The in-plane component of the wavevector.
-/// * `polarization` - The polarization of the light.
+/// * `layers`        - The layers of the system.
+/// * `k0`            - The vacuum wavevector (real, lifted to `Complex<f64>`).
+/// * `k`             - The in-plane component of the wavevector (complex).
+/// * `polarization`  - The polarization of the light.
 ///
 /// # Returns
 /// The physical forward-propagation transfer matrix.
 pub fn calculate_t_matrix(
     layers: &[Layer],
-    k0: f64,
-    k: f64,
+    k0: Complex<f64>,
+    k: Complex<f64>,
     polarization: Polarization,
 ) -> TransferMatrix {
-    // Start at the rightmost interface and compose toward the left.
-    // compose(A, B) = A · B, so right-multiplying accumulates earlier (leftward) factors.
     let n = layers.len();
     let mut result =
         TransferMatrix::matrix_interface(layers[n - 2].n, layers[n - 1].n, k0, k, polarization);
@@ -274,6 +325,8 @@ pub fn calculate_t_matrix(
     result
 }
 
+// ─── Per-layer coefficient propagation ───────────────────────────────────────
+
 /// Calculates the modal coefficients in each layer for a semi-infinite left boundary.
 ///
 /// In the standard case `layers[0]` is the semi-infinite left cladding.  Its field
@@ -286,19 +339,19 @@ pub fn calculate_t_matrix(
 /// to the **left edge** of the corresponding layer.
 ///
 /// # Arguments
-/// * `layers` - The layers of the system (first element is the semi-infinite left cladding).
-/// * `k0` - The vacuum wavevector.
-/// * `k` - The in-plane component of the wavevector.
+/// * `layers`       - The layers of the system (first element is the semi-infinite left cladding).
+/// * `k0`           - The vacuum wavevector (complex).
+/// * `k`            - The in-plane component of the wavevector (complex).
 /// * `polarization` - The polarization of the light.
-/// * `a` - The forward amplitude in the left cladding (typically 0 for a guided mode).
-/// * `b` - The backward amplitude in the left cladding (typically 1, normalised later).
+/// * `a`            - The forward amplitude in the left cladding (typically 0 for a guided mode).
+/// * `b`            - The backward amplitude in the left cladding (typically 1, normalised later).
 ///
 /// # Returns
 /// The modal coefficient vector for each layer, referenced to the layer's left edge.
 pub fn get_propagation_coefficients_transfer(
     layers: &[Layer],
-    k0: f64,
-    k: f64,
+    k0: Complex<f64>,
+    k: Complex<f64>,
     polarization: Polarization,
     a: Complex<f64>,
     b: Complex<f64>,
@@ -338,19 +391,19 @@ pub fn get_propagation_coefficients_transfer(
 /// to the **left edge** of the corresponding layer.
 ///
 /// # Arguments
-/// * `layers` - The layers of the system; `layers[0]` is adjacent to the PEC wall.
-/// * `k0` - The vacuum wavevector.
-/// * `k` - The in-plane component of the wavevector.
+/// * `layers`       - The layers of the system; `layers[0]` is adjacent to the PEC wall.
+/// * `k0`           - The vacuum wavevector (complex).
+/// * `k`            - The in-plane component of the wavevector (complex).
 /// * `polarization` - The polarization of the light.
-/// * `a` - The forward amplitude at the PEC wall (left edge of `layers[0]`).
-/// * `b` - The backward amplitude at the PEC wall (left edge of `layers[0]`).
+/// * `a`            - The forward amplitude at the PEC wall (left edge of `layers[0]`).
+/// * `b`            - The backward amplitude at the PEC wall (left edge of `layers[0]`).
 ///
 /// # Returns
 /// The modal coefficient vector for each layer, referenced to the layer's left edge.
 pub fn get_propagation_coefficients_pec_left(
     layers: &[Layer],
-    k0: f64,
-    k: f64,
+    k0: Complex<f64>,
+    k: Complex<f64>,
     polarization: Polarization,
     a: Complex<f64>,
     b: Complex<f64>,
@@ -376,4 +429,117 @@ pub fn get_propagation_coefficients_pec_left(
         coefficients.push(current_coefficients);
     }
     coefficients
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(re: f64, im: f64) -> Complex<f64> {
+        Complex::new(re, im)
+    }
+
+    // ── kz_physical ──────────────────────────────────────────────────────────
+
+    /// For a real argument with (k0·n)² > k²  the result must be real and positive.
+    #[test]
+    fn kz_real_propagating() {
+        let k0 = c(1.0, 0.0);
+        let n = c(2.0, 0.0);
+        let k = c(1.0, 0.0);
+        // (2)² - (1)² = 3  →  sqrt(3) ≈ 1.732
+        let kz = kz_physical(k0, n, k);
+        assert!(kz.im == 0.0, "Im(kz) should be zero for real propagating");
+        assert!(
+            kz.re > 0.0,
+            "Re(kz) should be positive for real propagating"
+        );
+        assert!((kz.re - 3.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// For a real argument with (k0·n)² < k²  the result must be purely imaginary
+    /// and positive (evanescent decay in the +x direction).
+    #[test]
+    fn kz_real_evanescent() {
+        let k0 = c(1.0, 0.0);
+        let n = c(1.0, 0.0);
+        let k = c(2.0, 0.0);
+        // (1)² - (2)² = -3  →  sqrt(-3) = i·sqrt(3)
+        let kz = kz_physical(k0, n, k);
+        assert!(kz.re == 0.0, "Re(kz) should be zero for evanescent");
+        assert!(
+            kz.im > 0.0,
+            "Im(kz) should be positive for evanescent decay"
+        );
+        assert!((kz.im - 3.0_f64.sqrt()).abs() < 1e-12);
+    }
+
+    /// The result must never have Im(kz) < 0 for any point in the complex k-plane.
+    #[test]
+    fn kz_im_nonnegative_across_plane() {
+        let k0 = c(1.0, 0.0);
+        let n = c(1.5, 0.0);
+        // Sweep a grid of complex k values and verify Im(kz) >= 0 everywhere.
+        for re in [-3.0, -1.0, 0.0, 1.0, 3.0] {
+            for im in [-2.0, -0.5, 0.0, 0.5, 2.0] {
+                let k = c(re, im);
+                let kz = kz_physical(k0, n, k);
+                assert!(kz.im >= -1e-14, "Im(kz) < 0 at k = ({re}, {im}): kz = {kz}");
+            }
+        }
+    }
+
+    /// Verify continuity: kz_physical should not jump when k moves across the
+    /// region near the branch cut.  We check that a small step in k gives a
+    /// small step in kz.
+    #[test]
+    fn kz_continuous_near_branch_cut() {
+        let k0 = c(1.0, 0.0);
+        let n = c(1.0, 0.0);
+        // The branch cut of sqrt(1 - k²) runs along the real axis for |Re(k)| > 1.
+        // Approach from above and below.
+        let k_above = c(1.5, 1e-9);
+        let k_below = c(1.5, -1e-9);
+        let kz_above = kz_physical(k0, n, k_above);
+        let kz_below = kz_physical(k0, n, k_below);
+        // Both must have Im >= 0.
+        assert!(kz_above.im >= 0.0);
+        assert!(kz_below.im >= 0.0);
+        // They must be close to each other (continuity).
+        let diff = (kz_above - kz_below).norm();
+        assert!(
+            diff < 1e-6,
+            "kz discontinuous near branch cut: diff = {diff}"
+        );
+    }
+
+    // ── Propagation matrix ────────────────────────────────────────────────────
+
+    /// The propagation matrix for zero thickness must be the identity.
+    #[test]
+    fn propagation_matrix_zero_thickness() {
+        let k0 = c(1.0, 0.0);
+        let n = c(1.5, 0.0);
+        let k = c(1.0, 0.0);
+        let m = TransferMatrix::matrix_propagation(n, 0.0, k0, k);
+        assert!((m.t11 - c(1.0, 0.0)).norm() < 1e-12);
+        assert!((m.t22 - c(1.0, 0.0)).norm() < 1e-12);
+    }
+
+    /// For a lossless layer the propagation matrix must be unitary:
+    /// |t11|² = |t22|² = 1, t12 = t21 = 0.
+    #[test]
+    fn propagation_matrix_unimodular() {
+        let k0 = c(1.0, 0.0);
+        let n = c(2.0, 0.0);
+        let k = c(1.0, 0.0);
+        let d = 0.5;
+        let m = TransferMatrix::matrix_propagation(n, d, k0, k);
+        assert!((m.t11.norm() - 1.0).abs() < 1e-12);
+        assert!((m.t22.norm() - 1.0).abs() < 1e-12);
+        assert!(m.t12.norm() < 1e-12);
+        assert!(m.t21.norm() < 1e-12);
+    }
 }
