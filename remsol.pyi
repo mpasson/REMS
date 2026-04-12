@@ -13,6 +13,20 @@ class BoundaryCondition(Enum):
     """Perfect Electric Conductor wall. The tangential electric field is forced
     to zero at this boundary."""
 
+class Normalization(Enum):
+    """Normalization convention used for field reconstruction."""
+
+    MaxField = 0
+    """Default. The field is normalized so that the maximum of the total electric
+    field amplitude equals 1: max(sqrt(|Ex|² + |Ey|² + |Ez|²)) = 1.
+    Works for all modes including leaky and lossy modes."""
+
+    Power = 1
+    """The field is normalized so that the absolute value of the integrated
+    z-component of the Poynting vector equals 1. Only physically meaningful for
+    lossless guided modes. If requested for a complex neff, a warning is emitted
+    and MaxField normalization is used instead."""
+
 class Polarization(Enum):
     """An enumeration of the two possible polarizations."""
 
@@ -114,6 +128,9 @@ class MultiLayer:
     plot_step: float
     """Step size used when sampling the field and index profiles (default: 1e-3)."""
 
+    normalization: Normalization
+    """Normalization convention used for field reconstruction (default: ``MaxField``)."""
+
     def __init__(self, layers: list[Layer | PEC]) -> None:
         """Create a new multilayer structure from a list of layers.
 
@@ -149,6 +166,13 @@ class MultiLayer:
         Args:
             bc: ``BoundaryCondition.SemiInfinite`` (default) or
                 ``BoundaryCondition.PEC``.
+        """
+
+    def set_normalization(self, norm: Normalization) -> None:
+        """Set the normalization convention used for field reconstruction.
+
+        Args:
+            norm: ``Normalization.MaxField`` (default) or ``Normalization.Power``.
         """
 
     def neff(
@@ -289,10 +313,51 @@ class MultiLayer:
 
         Returns:
             A ``FieldData`` object containing the full vectorial field
-            distribution (Ex, Ey, Ez, Hx, Hy, Hz) normalised so that the
-            integrated z-component of the Poynting vector equals 1.  If the
-            requested mode number exceeds the number of supported modes, a
-            ``FieldData`` with all field components set to zero is returned.
+            distribution (Ex, Ey, Ez, Hx, Hy, Hz) normalized according to the
+            current normalization setting (default: ``MaxField``, i.e. the
+            maximum total electric field amplitude equals 1).  If the requested
+            mode number exceeds the number of supported modes, a ``FieldData``
+            with all field components set to zero is returned.
+        """
+
+    def field_complex(
+        self,
+        omega: float,
+        polarization: Polarization = Polarization.TE,
+        neff_re: float = 0.0,
+        neff_im: float = 0.0,
+    ) -> FieldData:
+        """Calculate the field profile for a mode with a given complex effective index.
+
+        Unlike :meth:`field`, which uses the real-axis solver to find neff internally,
+        this method accepts an explicit complex neff (as returned by
+        :meth:`complex_neff` or :meth:`all_complex_neff`) and reconstructs the field
+        for that mode.
+
+        For semi-infinite boundaries the outgoing wave in the rightmost layer is
+        **not** zeroed: for a complex neff the radiation condition is already encoded
+        in the imaginary part, and zeroing the outgoing amplitude would give a
+        physically wrong result.
+
+        If ``Normalization.Power`` is set and ``neff_im != 0``, a warning is emitted
+        via Python's ``logging`` module and ``MaxField`` normalization is used instead.
+
+        Args:
+            omega: The angular frequency (real, same units as used for ``neff``).
+            polarization: The polarization of the mode (TE or TM).
+            neff_re: Real part of the complex effective index.
+            neff_im: Imaginary part of the complex effective index.
+
+        Returns:
+            A ``FieldData`` object with all six field components on the standard
+            plotting grid, normalized according to the current normalization setting
+            (default: ``MaxField``).
+
+        Examples:
+            Field for a lossy guided mode::
+
+                neff_re, neff_im = ml.complex_neff(omega, Polarization.TE)
+                field = ml.field_complex(omega, Polarization.TE, neff_re, neff_im)
         """
 
     def index(self) -> IndexData:

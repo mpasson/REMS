@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
+
 import remsol
+from remsol import Normalization
 from remsol import Polarization as pol
 
 slab = remsol.MultiLayer(
@@ -8,17 +10,56 @@ slab = remsol.MultiLayer(
         remsol.Layer(1, 1),
         remsol.Layer(2, 0.6),
         remsol.Layer(1, 1),
-        # remsol.Layer(2, 0.6),
-        # remsol.Layer(1, 1),
     ]
 )
 
+omega = 2.0 * np.pi / 1.55
 
-def test_single_amplitude():
-    field = slab.field(2.0 * np.pi / 1.55, pol.TE, 0)
-    amplitude = field.Ey[1300]
-    assert np.real(amplitude) == pytest.approx(21.207074050)
-    assert np.imag(amplitude) == pytest.approx(0.0)
+
+def test_max_field_normalization():
+    """Default normalization: max total |E| == 1."""
+    field = slab.field(omega, pol.TE, 0)
+    ex = np.array(field.Ex)
+    ey = np.array(field.Ey)
+    ez = np.array(field.Ez)
+    max_e = np.max(np.sqrt(np.abs(ex) ** 2 + np.abs(ey) ** 2 + np.abs(ez) ** 2))
+    assert max_e == pytest.approx(1.0, abs=1e-6)
+
+
+def test_power_normalization():
+    """Power normalization: integrated Poynting z-component == 1."""
+    slab_power = remsol.MultiLayer(
+        [remsol.Layer(1, 1), remsol.Layer(2, 0.6), remsol.Layer(1, 1)]
+    )
+    slab_power.set_normalization(Normalization.Power)
+    field = slab_power.field(omega, pol.TE, 0)
+    ex = np.array(field.Ex)
+    hy = np.array(field.Hy)
+    ey = np.array(field.Ey)
+    hx = np.array(field.Hx)
+    poynting = ex * np.conj(hy) - ey * np.conj(hx)
+    power = np.trapz(poynting, field.x)
+    assert abs(power) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_field_complex_max_field():
+    """field_complex with a lossy core: max total |E| == 1 (default MaxField norm)."""
+    lossy_slab = remsol.MultiLayer(
+        [
+            remsol.Layer(1.0, 1.0),
+            remsol.Layer(2.0 - 0.01j, 0.6),
+            remsol.Layer(1.0, 1.0),
+        ]
+    )
+    neff_re, neff_im = lossy_slab.complex_neff(
+        omega, pol.TE, mode=0, re_range=(1.0, 2.0), im_range=(-0.05, 0.05)
+    )
+    field = lossy_slab.field_complex(omega, pol.TE, neff_re, neff_im)
+    ex = np.array(field.Ex)
+    ey = np.array(field.Ey)
+    ez = np.array(field.Ez)
+    max_e = np.max(np.sqrt(np.abs(ex) ** 2 + np.abs(ey) ** 2 + np.abs(ez) ** 2))
+    assert max_e == pytest.approx(1.0, abs=1e-6)
 
 
 if __name__ == "__main__":
