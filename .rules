@@ -21,6 +21,7 @@ PyO3 bindings, built with Maturin.
 | Versioning      | python-semantic-release (bumps Cargo.toml version)   |
 | CI              | GitHub Actions                                       |
 | Docs            | Jupyter Book                                         |
+| Logging bridge  | pyo3-log (routes Rust `log` macros to Python `logging`) |
 
 ---
 
@@ -28,8 +29,8 @@ PyO3 bindings, built with Maturin.
 
 ```
 src/
-  lib.rs                — PyO3 module root; registers all Python-visible types
-  enums.rs              — Polarization (TE/TM) and BackEnd (Transfer/Scattering) enums
+  lib.rs                — PyO3 module root; registers all Python-visible types; calls pyo3_log::init()
+  enums.rs              — Polarization (TE/TM), BackEnd (Transfer/Scattering), Normalization (MaxField/Power) enums
   layer.rs              — Layer struct (n: Complex<f64>, d: f64) + LayerCoefficientVector
   multilayer.rs         — MultiLayer: solver, field calculation, Python API
   transfer_matrix.rs    — Transfer Matrix Method (TMM) backend + kz_physical helper
@@ -38,7 +39,7 @@ src/
 
 test/
   test_slab.py          — pytest: single slab, coupled slab, asymmetric coupled slab
-  test_field.py         — pytest: field profile amplitude at a specific grid point
+  test_field.py         — pytest: MaxField/Power normalization, field_complex on lossy slab
   test_pec.py           — pytest: PEC boundary condition tests
 
 remsol.pyi              — Python type stubs (must stay in sync with lib.rs pymodule)
@@ -137,13 +138,14 @@ uv run maturin develop --uv --release
 
 ### Backends
 - **Transfer Matrix Method (TMM)** — `BackEnd::Transfer` — supports both `neff()` and
-  `field()`. Default backend.
+  `field()` / `field_complex()`. Default backend.
 - **Scattering Matrix Method (SMM)** — `BackEnd::Scattering` — supports `neff()` only;
   field calculation is not implemented.
 - The complex-plane mode search (`complex_neff` / `all_complex_neff`) **always uses the
   SMM**, regardless of the `backend` setting, because the SMM is unconditionally
   numerically stable for complex `k` (it never forms products of exponentially growing
   and decaying terms in the same matrix element).
+- Field reconstruction (`field()` and `field_complex()`) always uses the TMM backend.
 
 ---
 
@@ -218,16 +220,17 @@ Returns complex `(Re(neff), Im(neff))` tuples. Handles:
 
 Exposed classes (registered in `lib.rs` pymodule, typed in `remsol.pyi`):
 
-| Rust type     | Python name   | Purpose                                           |
-|---------------|---------------|---------------------------------------------------|
-| `Polarization`| `Polarization`| Enum: `.TE`, `.TM`                                |
-| `BackEnd`     | `BackEnd`     | Enum: `.Transfer`, `.Scattering`                  |
-| `BoundaryCondition` | `BoundaryCondition` | Enum: `.SemiInfinite`, `.PEC`       |
-| `Layer`       | `Layer`       | `Layer(n: float | complex, d: float)`             |
-| `PEC`         | `PEC`         | Boundary marker; place first or last in layer list|
-| `MultiLayer`  | `MultiLayer`  | `MultiLayer(layers: list[Layer | PEC])`           |
-| `IndexData`   | `IndexData`   | Returned by `MultiLayer.index()`: x and Re(n)     |
-| `FieldData`   | `FieldData`   | Returned by `MultiLayer.field()`: x, Ex…Hz arrays |
+| Rust type       | Python name     | Purpose                                           |
+|-----------------|-----------------|---------------------------------------------------|
+| `Polarization`  | `Polarization`  | Enum: `.TE`, `.TM`                                |
+| `BackEnd`       | `BackEnd`       | Enum: `.Transfer`, `.Scattering`                  |
+| `BoundaryCondition` | `BoundaryCondition` | Enum: `.SemiInfinite`, `.PEC`           |
+| `Normalization` | `Normalization` | Enum: `.MaxField` (default), `.Power`             |
+| `Layer`         | `Layer`         | `Layer(n: float | complex, d: float)`             |
+| `PEC`           | `PEC`           | Boundary marker; place first or last in layer list|
+| `MultiLayer`    | `MultiLayer`    | `MultiLayer(layers: list[Layer | PEC])`           |
+| `IndexData`     | `IndexData`     | Returned by `MultiLayer.index()`: x and Re(n)     |
+| `FieldData`     | `FieldData`     | Returned by `MultiLayer.field()`: x, Ex…Hz arrays |
 
 Key `MultiLayer` methods:
 
@@ -237,10 +240,58 @@ Key `MultiLayer` methods:
 | `all_neff(omega, polarization)` | `list[float]` | Real-axis solver |
 | `complex_neff(omega, polarization, mode, re_range, im_range)` | `tuple[float,float] \| None` | Complex-plane solver |
 | `all_complex_neff(omega, polarization, re_range, im_range)` | `list[tuple[float,float]]` | Complex-plane solver |
-| `field(omega, polarization, mode)` | `FieldData` | TMM only |
+| `field(omega, polarization, mode)` | `FieldData` | TMM only; real neff from real-axis solver |
+| `field_complex(omega, polarization, neff_re, neff_im)` | `FieldData` | TMM; accepts explicit complex neff |
 | `index()` | `IndexData` | Real part of n |
 | `set_left_boundary(bc)` | `None` | Alternative to PEC marker |
 | `set_right_boundary(bc)` | `None` | Alternative to PEC marker |
+| `set_normalization(norm)` | `None` | Switch field normalization convention |
+
+---
+
+## Field Normalization
+
+Two normalization conventions are available, controlled by `MultiLayer.set_normalization()`:
+
+### `Normalization.MaxField` (default)
+Divides all field components by the maximum total electric field amplitude:
+`max(sqrt(|Ex|² + |Ey|² + |Ez|²)) = 1`.  Works for **all** modes: lossless guided,
+lossy guided, and leaky.  This is the default.
+
+### `Normalization.Power`
+Divides all field components by `sqrt(|∫ (Ex·Hy* − Ey·Hx*) dx|)` so that the
+absolute value of the integrated z-component of the Poynting vector equals 1.
+Only physically meaningful for **lossless guided modes** (real neff, finite power).
+
+**Warning behaviour**: if `Normalization.Power` is requested via `field_complex()` and
+`Im(neff) ≠ 0`, the library emits a `WARNING`-level log message through Python's
+standard `logging` module and falls back to `MaxField` normalization automatically.
+Users can observe or suppress this warning using the standard Python logging API:
+```python
+import logging
+logging.basicConfig(level=logging.WARNING)  # show all warnings
+logging.getLogger("remsol").setLevel(logging.ERROR)  # suppress remsol warnings
+```
+
+---
+
+## Logging
+
+REMSOL uses the `log` crate (Rust) bridged to Python's `logging` module via `pyo3-log`.
+This means all Rust-side log messages (warnings, debug info) are routed to the Python
+`logging` system automatically when the extension is imported.
+
+- The logger name mirrors the Rust module path, with `::` replaced by `.`
+  (e.g. `remsol::multilayer` → `remsol.multilayer`).
+- Standard Python logging configuration applies:
+  ```python
+  import logging
+  logging.basicConfig(level=logging.DEBUG)   # see all messages
+  logging.getLogger("remsol").setLevel(logging.WARNING)  # only warnings+
+  ```
+- Do **not** use `eprintln!` or `println!` for diagnostic output in Rust — use the
+  `log` macros (`warn!`, `info!`, `debug!`, `trace!`) so that Python users can control
+  verbosity.
 
 ---
 
@@ -256,6 +307,8 @@ Key `MultiLayer` methods:
 - Use `num_complex::Complex<f64>` for all complex arithmetic.
 - All transverse wavevectors must go through `kz_physical` — never use bare `.sqrt()`.
 - The complex-plane solver always uses the SMM backend. Do not add a TMM path for it.
+- Use `log::warn!` / `log::info!` / `log::debug!` for all diagnostic output — never
+  `eprintln!` or `println!` in library code.
 
 ### Python / Type Stubs
 - **Always keep `remsol.pyi` in sync** whenever the Python-visible API changes in
@@ -360,10 +413,13 @@ git push && git push --tags
 ## Known Limitations and Out-of-Scope Items
 
 - Only **1D planar** structures; no 2D or 3D geometries.
-- The **SMM backend does not support field calculation** (`field()` always uses TMM).
+- The **SMM backend does not support field calculation** (`field()` and `field_complex()`
+  always use the TMM backend regardless of `MultiLayer.backend`).
 - The **complex-plane solver does not support PEC boundary conditions** — it always uses
   the SMM with semi-infinite boundary conditions.
-- Field reconstruction (`field()`) uses real `neff` from the real-axis solver and does
-  not yet accept complex `neff` as input.
+- `field_complex()` does not support PEC boundary conditions for the same reason: the
+  complex neff search (which provides the input neff) requires semi-infinite boundaries.
 - The `index()` method returns only `Re(n)` for plotting; imaginary parts of the index
   profile are not currently visualised.
+- **Power normalization** (`Normalization.Power`) is only physically meaningful for
+  lossless guided modes. For complex neff it falls back to `MaxField` with a warning.
