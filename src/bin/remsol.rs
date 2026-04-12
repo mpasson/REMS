@@ -11,9 +11,24 @@ use remsol::enums::Polarization;
 use remsol::layer::Layer;
 use remsol::multilayer::MultiLayer;
 
+/// A TOML-friendly mirror of `Layer` that stores `n` as a plain `f64`.
+/// After deserialisation it is converted to `Layer` (which stores `n` as
+/// `Complex<f64>`) via `From<SerdeLayer>`.
+#[derive(Serialize, Deserialize, Debug)]
+struct SerdeLayer {
+    n: f64,
+    d: f64,
+}
+
+impl From<SerdeLayer> for Layer {
+    fn from(sl: SerdeLayer) -> Layer {
+        Layer::from_real(sl.n, sl.d)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Settings {
-    layers: Vec<Layer>,
+    layers: Vec<SerdeLayer>,
     #[serde(default = "Settings::default_runs")]
     runs: Vec<RunSettings>,
 }
@@ -49,21 +64,20 @@ struct Cli {
 }
 
 fn parse_file(file_path: String) -> Result<Settings, Box<dyn Error>> {
-    // Read the file contents into a string
     let contents = fs::read_to_string(file_path)?;
-    let run_settings: Settings = toml::from_str(&contents)?;
-    Ok(run_settings)
+    let settings: Settings = toml::from_str(&contents)?;
+    Ok(settings)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Specify the path to the file
-    //
     let cli = Cli::parse();
     let file_path = cli.file;
 
     let mut settings = parse_file(file_path)?;
 
-    let multilayer = MultiLayer::new(settings.layers);
+    // Convert SerdeLayer → Layer.
+    let layers: Vec<Layer> = settings.layers.into_iter().map(Layer::from).collect();
+    let multilayer = MultiLayer::new(layers);
 
     if let (Some(k0), Some(mode), Some(polarization)) = (cli.k0, cli.mode, cli.polarization) {
         settings.runs.push(RunSettings {
