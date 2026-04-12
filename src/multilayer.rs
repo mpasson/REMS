@@ -35,8 +35,11 @@ const Z0: Complex<f64> = Complex {
 };
 
 /// Minimum imaginary half-width of the complex search rectangle when all layers
-/// are lossless.  Ensures that weakly leaky modes are not missed.
-const MIN_IM_HALF_WIDTH: f64 = 1e-3;
+/// are lossless.  Large enough to avoid degenerate aspect ratios that make the
+/// winding-number contour unreliable: the contour must not hug the real axis
+/// too closely relative to the real-axis width of the search rectangle.
+/// A value of 0.05 keeps the aspect ratio below ~20:1 for typical structures.
+const MIN_IM_HALF_WIDTH: f64 = 0.05;
 
 /// Number of points used to discretise each side of the contour when computing
 /// the winding number via the argument principle.
@@ -622,21 +625,21 @@ impl MultiLayer {
         }
     }
 
-    /// Evaluates the characteristic function for a **complex** in-plane wavevector `k`.
+    /// Evaluates `1 / det(S)` for a **complex** in-plane wavevector `k`.
     ///
-    /// Returns `1 / det(S)`, so that its **zeros** coincide with the **poles** of
-    /// `det(S)`, which in turn are the guided/leaky/lossy modes of the structure.
+    /// Used **only for the winding-number contour integral**.  Modes are
+    /// *zeros* of `det(S)`, hence *poles* of `1/det(S)`.  The argument
+    /// principle applied to `1/det(S)` gives `#zeros − #poles = −N_modes`,
+    /// and taking the absolute value recovers the mode count `N_modes`.
     ///
-    /// Using the reciprocal has two advantages over using `det(S)` directly:
+    /// Using the reciprocal (rather than `det(S)` itself) makes the argument
+    /// change around each pole large and spread-out, so a moderately coarse
+    /// contour sample still accumulates the full `±2π` contribution reliably.
     ///
-    /// 1. The argument-principle winding number counts zeros of the function passed
-    ///    to it.  `det(S)` has zeros at modes, so `1/det(S)` has *poles* there —
-    ///    but numerically `det(S)` is enormously large near a mode and tiny
-    ///    elsewhere, making the argument change very localised and easily missed by
-    ///    a coarse contour.  Using `1/det(S)` inverts this: the function is tiny
-    ///    near a mode and large elsewhere, giving a robust winding-number signal.
-    ///
-    /// 2. The SMM is used (not the TMM) for numerical stability with complex `k`.
+    /// **Do not use this function as the objective for root polishing.**
+    /// It has poles (not zeros) at the mode locations; Muller's method would
+    /// converge to something that is not a mode.  Use [`det_s_complex`]
+    /// instead for polishing.
     ///
     /// # Arguments
     /// * `k0`           - Vacuum wavevector (real).
@@ -760,7 +763,12 @@ impl MultiLayer {
     ) -> ((f64, f64), (f64, f64)) {
         let re = re_range.unwrap_or_else(|| {
             let (min_n, max_n) = self.find_minmax_n();
-            (min_n, max_n)
+            // Pull the real-axis bounds slightly inward so the contour never
+            // lands exactly on n_min or n_max, where kz = 0 in some layer and
+            // the S-matrix compose denominator (1 − s12·s21) can hit zero,
+            // producing NaN and corrupting the winding-number integral.
+            let margin = 1e-6;
+            (min_n + margin, max_n - margin)
         });
         let im = im_range.unwrap_or_else(|| {
             let max_im = self
@@ -845,6 +853,11 @@ impl MultiLayer {
         }
 
         // Evaluate f on the contour and accumulate the total argument change.
+        // Guard: if any evaluation produces NaN or Inf (which can happen when the
+        // contour passes through a branch point of the S-matrix, e.g. neff = n_max
+        // where kz = 0 and the compose denominator 1 − s12·s21 vanishes), skip that
+        // segment.  A single bad point does not corrupt the whole integral because
+        // the winding contribution from the rest of the contour is unchanged.
         let fvals: Vec<Complex<f64>> = contour
             .iter()
             .map(|&k| self.characteristic_function_complex(k0, k, polarization))
@@ -855,6 +868,14 @@ impl MultiLayer {
         for i in 0..n {
             let f_curr = fvals[i];
             let f_next = fvals[(i + 1) % n];
+            // Skip segments where either endpoint is non-finite (NaN / Inf).
+            if !f_curr.re.is_finite()
+                || !f_curr.im.is_finite()
+                || !f_next.re.is_finite()
+                || !f_next.im.is_finite()
+            {
+                continue;
+            }
             // Argument of f_next / f_curr — use atan2 of the ratio for numerical
             // stability near the real axis.
             let ratio = f_next / f_curr;
@@ -1063,7 +1084,9 @@ impl MultiLayer {
         }
 
         // Return best estimate even if tolerance was not fully reached.
-        if f2.norm() < 1e-4 {
+        // 1/det(S) is ~0 at modes, so 1e-6 is a reasonable loose fallback
+        // (MULLER_TOL = 1e-10 is the tight criterion).
+        if f2.norm() < 1e-6 {
             Some(x2)
         } else {
             None
