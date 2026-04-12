@@ -320,44 +320,54 @@ class MultiLayer:
             with all field components set to zero is returned.
         """
 
-    def field_complex(
+    def complex_field(
         self,
         omega: float,
         polarization: Polarization = Polarization.TE,
-        neff_re: float = 0.0,
-        neff_im: float = 0.0,
+        mode: int = 0,
+        re_range: tuple[float, float] | None = None,
+        im_range: tuple[float, float] | None = None,
     ) -> FieldData:
-        """Calculate the field profile for a mode with a given complex effective index.
+        """Calculate the field profile of a complex mode found by the complex-plane solver.
 
-        Unlike :meth:`field`, which uses the real-axis solver to find neff internally,
-        this method accepts an explicit complex neff (as returned by
-        :meth:`complex_neff` or :meth:`all_complex_neff`) and reconstructs the field
-        for that mode.
+        Mirrors the signature of :meth:`field` but uses the complex-plane solver
+        (:meth:`complex_neff`) to find the effective index, then reconstructs the
+        field for that mode.
 
         For semi-infinite boundaries the outgoing wave in the rightmost layer is
         **not** zeroed: for a complex neff the radiation condition is already encoded
         in the imaginary part, and zeroing the outgoing amplitude would give a
         physically wrong result.
 
-        If ``Normalization.Power`` is set and ``neff_im != 0``, a warning is emitted
-        via Python's ``logging`` module and ``MaxField`` normalization is used instead.
+        If ``Normalization.Power`` is set and the found ``neff`` has a nonzero
+        imaginary part, a warning is emitted via Python's ``logging`` module and
+        ``MaxField`` normalization is used instead.
 
         Args:
-            omega: The angular frequency (real, same units as used for ``neff``).
+            omega: The angular frequency (real).
             polarization: The polarization of the mode (TE or TM).
-            neff_re: Real part of the complex effective index.
-            neff_im: Imaginary part of the complex effective index.
+            mode: Zero-based mode index (same ordering as :meth:`complex_neff`).
+            re_range: Optional ``(re_min, re_max)`` forwarded to the complex-plane
+                solver.  Defaults to ``(Re(n_min), Re(n_max))`` across all layers.
+            im_range: Optional ``(im_min, im_max)`` forwarded to the complex-plane
+                solver.  Defaults to ``(-w, +w)`` where
+                ``w = max(max_j |Im(n_j)|, 0.05)``.
 
         Returns:
             A ``FieldData`` object with all six field components on the standard
             plotting grid, normalized according to the current normalization setting
-            (default: ``MaxField``).
+            (default: ``MaxField``).  If the requested mode does not exist, a
+            ``FieldData`` with all components set to zero is returned.
 
         Examples:
-            Field for a lossy guided mode::
+            Fundamental TE mode of a lossy slab::
 
-                neff_re, neff_im = ml.complex_neff(omega, Polarization.TE)
-                field = ml.field_complex(omega, Polarization.TE, neff_re, neff_im)
+                ml = MultiLayer([
+                    Layer(1.0, 1.0),
+                    Layer(2.0 - 0.01j, 0.6),
+                    Layer(1.0, 1.0),
+                ])
+                field = ml.complex_field(omega, Polarization.TE, mode=0)
         """
 
     def index(self) -> IndexData:

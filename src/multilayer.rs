@@ -496,36 +496,44 @@ impl MultiLayer {
         self.normalization = norm;
     }
 
-    /// Calculates the field profile for a mode with a given complex effective index.
+    /// Calculates the field profile of a complex mode found by the complex-plane solver.
     ///
-    /// Unlike `field()`, which uses the real-axis solver to find neff internally,
-    /// this method accepts an explicit complex neff (as returned by `complex_neff`
-    /// or `all_complex_neff`) and reconstructs the field for that mode.
+    /// Mirrors the signature of [`python_field`] but uses the complex-plane solver
+    /// ([`python_complex_neff`]) to find the effective index, then reconstructs the
+    /// field for that mode.
     ///
     /// For semi-infinite boundaries the outgoing wave in the rightmost layer is
     /// **not** zeroed: for a complex neff the radiation condition is already encoded
-    /// in the imaginary part of neff, and zeroing the outgoing amplitude would give
-    /// a physically wrong result.
+    /// in the imaginary part, and zeroing the outgoing amplitude would give a
+    /// physically wrong result.
     ///
     /// # Arguments
-    /// * `omega`        - The angular frequency (real, same units as used for `neff`).
+    /// * `omega`        - The angular frequency (real).
     /// * `polarization` - The polarization of the mode.
-    /// * `neff_re`      - Real part of the complex effective index.
-    /// * `neff_im`      - Imaginary part of the complex effective index.
+    /// * `mode`         - Zero-based mode index (same ordering as [`python_complex_neff`]).
+    /// * `re_range`     - Optional `(re_min, re_max)` forwarded to the complex-plane solver.
+    /// * `im_range`     - Optional `(im_min, im_max)` forwarded to the complex-plane solver.
     /// # Returns
-    /// A `FieldData` with all six field components on the standard plotting grid.
-    #[pyo3(name = "field_complex")]
-    #[pyo3(signature = (omega, polarization=None, neff_re=0.0, neff_im=0.0))]
-    pub fn python_field_complex(
+    /// A `FieldData` with all six field components on the standard plotting grid,
+    /// or a zeroed `FieldData` if the requested mode does not exist.
+    #[pyo3(name = "complex_field")]
+    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None))]
+    pub fn python_complex_field(
         &self,
         omega: f64,
         polarization: Option<Polarization>,
-        neff_re: f64,
-        neff_im: f64,
+        mode: Option<usize>,
+        re_range: Option<(f64, f64)>,
+        im_range: Option<(f64, f64)>,
     ) -> FieldData {
         let polarization = polarization.unwrap_or(Polarization::TE);
-        let neff = Complex::new(neff_re, neff_im);
-        self.field_complex(omega, polarization, neff)
+        let mode = mode.unwrap_or(0);
+        let (re_range, im_range) = self.default_search_ranges(re_range, im_range);
+        let roots = self.solve_complex(omega, polarization, re_range, im_range);
+        match roots.get(mode) {
+            Some(&neff) => self.field_complex(omega, polarization, neff),
+            None => FieldData::zeros(self.get_grid_data().xplot),
+        }
     }
 }
 

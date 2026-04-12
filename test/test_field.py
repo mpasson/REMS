@@ -42,8 +42,8 @@ def test_power_normalization():
     assert abs(power) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_field_complex_max_field():
-    """field_complex with a lossy core: max total |E| == 1 (default MaxField norm)."""
+def test_complex_field_max_field():
+    """complex_field with a lossy core: max total |E| == 1 (default MaxField norm)."""
     lossy_slab = remsol.MultiLayer(
         [
             remsol.Layer(1.0, 1.0),
@@ -51,10 +51,7 @@ def test_field_complex_max_field():
             remsol.Layer(1.0, 1.0),
         ]
     )
-    neff_re, neff_im = lossy_slab.complex_neff(
-        omega, pol.TE, mode=0, re_range=(1.0, 2.0), im_range=(-0.05, 0.05)
-    )
-    field = lossy_slab.field_complex(omega, pol.TE, neff_re, neff_im)
+    field = lossy_slab.complex_field(omega, pol.TE, mode=0)
     ex = np.array(field.Ex)
     ey = np.array(field.Ey)
     ez = np.array(field.Ez)
