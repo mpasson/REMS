@@ -21,7 +21,7 @@ use num_complex::Complex;
 
 use crate::enums::Polarization;
 use crate::layer::Layer;
-use crate::transfer_matrix::kz_physical;
+use crate::transfer_matrix::{kz_outgoing, kz_physical};
 
 /// Struct representing the scattering matrix.
 #[derive(Debug)]
@@ -192,6 +192,71 @@ impl ScatteringMatrix {
             Polarization::TM => ScatteringMatrix::matrix_interface_tm(n1, n2, k0, k),
         }
     }
+
+    /// Creates a TE scattering matrix for an interface using pre-computed transverse
+    /// wavevectors.
+    ///
+    /// Use this variant when a non-standard kz convention (e.g. [`kz_outgoing`]) is
+    /// required for one or both sides of the interface, rather than the default
+    /// `kz_physical` used by [`matrix_interface_te`].
+    ///
+    /// # Arguments
+    /// * `kz1` - Transverse wavevector in the left medium.
+    /// * `kz2` - Transverse wavevector in the right medium.
+    pub fn matrix_interface_te_from_kz(kz1: Complex<f64>, kz2: Complex<f64>) -> ScatteringMatrix {
+        ScatteringMatrix {
+            s11: 2.0 * kz2 / (kz1 + kz2),
+            s12: (kz2 - kz1) / (kz1 + kz2),
+            s21: (kz1 - kz2) / (kz1 + kz2),
+            s22: 2.0 * kz1 / (kz1 + kz2),
+        }
+    }
+
+    /// Creates a TM scattering matrix for an interface using pre-computed transverse
+    /// wavevectors.
+    ///
+    /// # Arguments
+    /// * `n1`  - Refractive index of the left medium.
+    /// * `n2`  - Refractive index of the right medium.
+    /// * `kz1` - Transverse wavevector in the left medium.
+    /// * `kz2` - Transverse wavevector in the right medium.
+    pub fn matrix_interface_tm_from_kz(
+        n1: Complex<f64>,
+        n2: Complex<f64>,
+        kz1: Complex<f64>,
+        kz2: Complex<f64>,
+    ) -> ScatteringMatrix {
+        let k1 = n2.powi(2) * kz1;
+        let k2 = n1.powi(2) * kz2;
+        ScatteringMatrix {
+            s11: 2.0 * k2 / (k1 + k2),
+            s12: (k2 - k1) / (k1 + k2),
+            s21: (k1 - k2) / (k1 + k2),
+            s22: 2.0 * k1 / (k1 + k2),
+        }
+    }
+
+    /// Creates a scattering matrix for an interface using pre-computed transverse
+    /// wavevectors, dispatching on polarisation.
+    ///
+    /// # Arguments
+    /// * `n1`           - Refractive index of the left medium.
+    /// * `n2`           - Refractive index of the right medium.
+    /// * `kz1`          - Transverse wavevector in the left medium.
+    /// * `kz2`          - Transverse wavevector in the right medium.
+    /// * `polarization` - Polarisation.
+    pub fn matrix_interface_from_kz(
+        n1: Complex<f64>,
+        n2: Complex<f64>,
+        kz1: Complex<f64>,
+        kz2: Complex<f64>,
+        polarization: Polarization,
+    ) -> ScatteringMatrix {
+        match polarization {
+            Polarization::TE => ScatteringMatrix::matrix_interface_te_from_kz(kz1, kz2),
+            Polarization::TM => ScatteringMatrix::matrix_interface_tm_from_kz(n1, n2, kz1, kz2),
+        }
+    }
 }
 
 /// Calculates the scattering matrix for a multilayer system.
@@ -218,6 +283,181 @@ pub fn calculate_s_matrix(
         let matrix = ScatteringMatrix::matrix_interface(layer1.n, layer2.n, k0, k, polarization);
         result = result.compose(matrix);
     }
+    result
+}
+
+/// Calculates the scattering matrix for a multilayer system using
+/// **outgoing-wave** boundary conditions on the semi-infinite cladding layers.
+///
+/// Unlike [`calculate_s_matrix`], which uses `kz_physical` (`Im(kz) ≥ 0`) for all
+/// layers, this function applies [`kz_outgoing`] (`Im(kz) ≤ 0`) to the first layer
+/// (left cladding) and the last layer (right cladding).  All interior layers
+/// continue to use `kz_physical`.
+///
+/// The resulting S-matrix has zeros of its determinant at **quasi-normal mode (QNM)**
+/// eigenvalues — the complex effective indices at which outgoing waves exist in both
+/// claddings simultaneously with no incoming excitation.  QNM poles therefore live in
+/// the *lower* half of the complex `neff` plane (`Im(neff) < 0`).
+///
+/// # Arguments
+/// * `layers`       - The layers of the system (first and last treated as claddings).
+/// * `k0`           - The vacuum wavevector (complex, but typically real).
+/// * `k`            - The in-plane wavevector (complex for QNMs, `Im(k) < 0`).
+/// * `polarization` - The polarisation of the light.
+///
+/// # Returns
+/// The scattering matrix built with outgoing-wave boundary conditions.
+pub fn calculate_s_matrix_qnm(
+    layers: &[Layer],
+    k0: Complex<f64>,
+    k: Complex<f64>,
+    polarization: Polarization,
+) -> ScatteringMatrix {
+    debug_assert!(layers.len() >= 2, "QNM S-matrix requires at least 2 layers");
+
+    // ── First interface (left cladding → first interior layer) ────────────────
+    // The left cladding always uses kz_outgoing (outgoing radiation to the left).
+    // If the structure has only two layers (no interior layers at all) the right
+    // layer is also a cladding and likewise uses kz_outgoing; otherwise it is an
+    // interior layer and uses kz_physical.
+    let kz0 = kz_outgoing(k0, layers[0].n, k);
+    let kz1 = if layers.len() == 2 {
+        kz_outgoing(k0, layers[1].n, k)
+    } else {
+        kz_physical(k0, layers[1].n, k)
+    };
+    let mut result = ScatteringMatrix::matrix_interface_from_kz(
+        layers[0].n,
+        layers[1].n,
+        kz0,
+        kz1,
+        polarization,
+    );
+
+    // ── Interior propagation + interfaces ─────────────────────────────────────
+    // Iterate over consecutive pairs starting at layers[1]:
+    //   (layers[1], layers[2]), …, (layers[n-2], layers[n-1]).
+    // The last pair terminates at the right cladding (layers[n-1]), which uses
+    // kz_outgoing; all earlier pairs are between interior layers and use kz_physical.
+    let pairs: Vec<_> = layers.windows(2).skip(1).collect();
+    let n_pairs = pairs.len();
+    for (i, window) in pairs.iter().enumerate() {
+        let layer1 = &window[0];
+        let layer2 = &window[1];
+
+        // Propagation through layer1 (interior): always kz_physical.
+        let prop = ScatteringMatrix::matrix_propagation(layer1.n, layer1.d, k0, k);
+        result = result.compose(prop);
+
+        // Interface: last pair reaches the right cladding (kz_outgoing);
+        // all others are interior-to-interior (kz_physical on both sides).
+        let intf = if i + 1 == n_pairs {
+            let kz_left = kz_physical(k0, layer1.n, k);
+            let kz_right = kz_outgoing(k0, layer2.n, k);
+            ScatteringMatrix::matrix_interface_from_kz(
+                layer1.n,
+                layer2.n,
+                kz_left,
+                kz_right,
+                polarization,
+            )
+        } else {
+            ScatteringMatrix::matrix_interface(layer1.n, layer2.n, k0, k, polarization)
+        };
+        result = result.compose(intf);
+    }
+
+    result
+}
+
+/// Calculates the scattering matrix for a multilayer system using a
+/// **one-sided leaky** boundary condition.
+///
+/// The left cladding (first layer) uses [`kz_physical`] — the standard
+/// evanescent-decay condition, identical to the ordinary guided-mode solver.
+/// The right cladding (last layer) uses [`kz_outgoing`] — the outgoing-wave
+/// condition, so energy radiates into the substrate.  All interior layers
+/// continue to use [`kz_physical`].
+///
+/// This boundary condition models a mode that is evanescently confined on the
+/// low-index side (typically air) and radiates into a higher-index substrate on
+/// the other side.  The zeros of the resulting S-matrix determinant are the
+/// complex effective indices of those one-sided leaky modes; they sit in the
+/// **lower** half of the complex `neff` plane (`Im(neff) < 0`), and their real
+/// part stays close to the guided-mode value of the isolated core.
+///
+/// Compare with:
+/// * [`calculate_s_matrix`]     — `kz_physical` everywhere (guided modes).
+/// * [`calculate_s_matrix_qnm`] — `kz_outgoing` on **both** claddings (full QNMs).
+///
+/// # Arguments
+/// * `layers`       - The layers of the system (first and last treated as claddings).
+/// * `k0`           - The vacuum wavevector (complex, but typically real).
+/// * `k`            - The in-plane wavevector (complex, `Im(k) < 0` for leaky modes).
+/// * `polarization` - The polarisation of the light.
+///
+/// # Returns
+/// The scattering matrix built with a one-sided leaky boundary condition.
+pub fn calculate_s_matrix_leaky_right(
+    layers: &[Layer],
+    k0: Complex<f64>,
+    k: Complex<f64>,
+    polarization: Polarization,
+) -> ScatteringMatrix {
+    debug_assert!(
+        layers.len() >= 2,
+        "leaky-right S-matrix requires at least 2 layers"
+    );
+
+    // Left cladding always uses kz_physical (evanescent / guided-mode BC).
+    // If there are only two layers the right layer is the right cladding and
+    // therefore uses kz_outgoing; otherwise it is an interior layer and uses
+    // kz_physical.
+    let kz0 = kz_physical(k0, layers[0].n, k);
+    let kz1 = if layers.len() == 2 {
+        kz_outgoing(k0, layers[1].n, k)
+    } else {
+        kz_physical(k0, layers[1].n, k)
+    };
+    let mut result = ScatteringMatrix::matrix_interface_from_kz(
+        layers[0].n,
+        layers[1].n,
+        kz0,
+        kz1,
+        polarization,
+    );
+
+    // Interior propagation + interfaces.
+    // The last pair terminates at the right cladding (kz_outgoing);
+    // all earlier pairs are interior-to-interior (kz_physical on both sides).
+    let pairs: Vec<_> = layers.windows(2).skip(1).collect();
+    let n_pairs = pairs.len();
+    for (i, window) in pairs.iter().enumerate() {
+        let layer1 = &window[0];
+        let layer2 = &window[1];
+
+        // Propagation through layer1 (interior): always kz_physical.
+        let prop = ScatteringMatrix::matrix_propagation(layer1.n, layer1.d, k0, k);
+        result = result.compose(prop);
+
+        // Interface: last pair reaches the right cladding (kz_outgoing);
+        // all others are interior-to-interior (kz_physical on both sides).
+        let intf = if i + 1 == n_pairs {
+            let kz_left = kz_physical(k0, layer1.n, k);
+            let kz_right = kz_outgoing(k0, layer2.n, k);
+            ScatteringMatrix::matrix_interface_from_kz(
+                layer1.n,
+                layer2.n,
+                kz_left,
+                kz_right,
+                polarization,
+            )
+        } else {
+            ScatteringMatrix::matrix_interface(layer1.n, layer2.n, k0, k, polarization)
+        };
+        result = result.compose(intf);
+    }
+
     result
 }
 

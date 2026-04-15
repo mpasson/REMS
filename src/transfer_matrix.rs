@@ -75,6 +75,26 @@ pub fn kz_physical(k0: Complex<f64>, n: Complex<f64>, k: Complex<f64>) -> Comple
     }
 }
 
+/// Returns the transverse wavevector on the **outgoing-wave sheet**: `Im(kz) ≤ 0`.
+///
+/// This is exactly `-kz_physical(k0, n, k)` and places the computation on the
+/// Riemann sheet required for **quasi-normal modes (QNMs)** and leaky resonances.
+///
+/// Physics: a QNM has energy flowing *away* from the structure in both semi-infinite
+/// cladding layers.  This outgoing radiation condition requires `Im(kz) ≤ 0` in the
+/// outermost layers (the evanescent tail grows spatially rather than decays, consistent
+/// with a mode that decays in *time*).  The standard `kz_physical` convention
+/// (`Im(kz) ≥ 0`) enforces the opposite — exponential decay — which is correct for
+/// bound guided modes but places the solver on the wrong Riemann sheet for QNMs.
+///
+/// # Arguments
+/// * `k0` - Vacuum wavevector (real, passed as `Complex<f64>` for uniformity).
+/// * `n`  - Refractive index of the layer (may be complex for lossy / gain media).
+/// * `k`  - In-plane (propagation) wavevector (may be complex).
+pub fn kz_outgoing(k0: Complex<f64>, n: Complex<f64>, k: Complex<f64>) -> Complex<f64> {
+    -kz_physical(k0, n, k)
+}
+
 // ─── Transfer matrix struct ───────────────────────────────────────────────────
 
 /// Struct representing the transfer matrix.

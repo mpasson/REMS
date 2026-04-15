@@ -370,6 +370,207 @@ class MultiLayer:
                 field = ml.complex_field(omega, Polarization.TE, mode=0)
         """
 
+    def qnm_neff(
+        self,
+        omega: float,
+        polarization: Polarization = Polarization.TE,
+        mode: int = 0,
+        re_range: tuple[float, float] | None = None,
+        im_range: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        """Find a single quasi-normal mode (QNM) effective index.
+
+        QNMs satisfy **outgoing-wave** boundary conditions in both semi-infinite
+        cladding layers: rather than decaying evanescently away from the guiding
+        region, the field radiates outward.  Their effective indices are complex
+        with ``Im(neff) < 0`` (energy leaks out, so the mode decays in time).
+
+        The solver uses the same argument-principle winding-number / Muller-polisher
+        pipeline as :meth:`complex_neff`, but evaluates the S-matrix built with
+        ``kz_outgoing`` (the outgoing Riemann sheet) on the first and last cladding
+        layers.  Consequently the search rectangle should lie **entirely in the lower
+        half-plane** (``im_max ≤ 0``).
+
+        Default search ranges (used when the corresponding argument is ``None``):
+
+        * **re_range**: ``(Re(n_min) + ε, Re(n_max) − ε)`` across all layers.
+        * **im_range**: ``(-0.5, -1e-3)`` — entirely below the real axis.
+
+        Args:
+            omega: The angular frequency (real).
+            polarization: The polarization of the mode (TE or TM).
+            mode: Zero-based index into the list returned by :meth:`all_qnm_neff`,
+                sorted by descending ``Re(neff)``.
+            re_range: Optional ``(re_min, re_max)`` for the real part of ``neff``.
+                Widen to include strongly leaky modes, e.g. ``(0.0, n_max)``.
+            im_range: Optional ``(im_min, im_max)`` for the imaginary part of
+                ``neff``.  Must satisfy ``im_max ≤ 0``.  Widen ``im_min`` to
+                capture modes with large radiation loss, e.g. ``(-2.0, -1e-3)``.
+
+        Returns:
+            ``(Re(neff), Im(neff))`` as a tuple with ``Im(neff) < 0``, or ``None``
+            if the requested mode index is out of range.
+
+        Examples:
+            Leaky mode of an asymmetric slab (core over a higher-index substrate)::
+
+                layers = [
+                    Layer(1.0, 1.0),   # air cladding
+                    Layer(2.0, 0.6),   # waveguide core
+                    Layer(1.0, 0.5),   # thin air gap
+                    Layer(2.2, 1.0),   # substrate (semi-infinite)
+                ]
+                ml = MultiLayer(layers)
+                re, im = ml.qnm_neff(omega)
+                # im < 0  →  radiation loss into the substrate
+
+            Wider search for strongly leaky modes::
+
+                re, im = ml.qnm_neff(omega, im_range=(-2.0, -1e-3))
+        """
+
+    def all_qnm_neff(
+        self,
+        omega: float,
+        polarization: Polarization = Polarization.TE,
+        re_range: tuple[float, float] | None = None,
+        im_range: tuple[float, float] | None = None,
+    ) -> list[tuple[float, float]]:
+        """Return all quasi-normal mode (QNM) effective indices in the search rectangle.
+
+        Uses the same argument-principle / Muller-polisher pipeline as
+        :meth:`all_complex_neff`, but with outgoing-wave boundary conditions on
+        the semi-infinite cladding layers.  All returned modes satisfy
+        ``Im(neff) < 0``.
+
+        Default search ranges are the same as :meth:`qnm_neff`.
+
+        Args:
+            omega: The angular frequency (real).
+            polarization: The polarization of the modes (TE or TM).
+            re_range: Optional ``(re_min, re_max)`` for ``Re(neff)``.
+            im_range: Optional ``(im_min, im_max)`` for ``Im(neff)``;
+                must satisfy ``im_max ≤ 0``.
+
+        Returns:
+            A list of ``(Re(neff), Im(neff))`` tuples sorted by descending
+            ``Re(neff)``.  All tuples satisfy ``Im(neff) < 0``.
+
+        Examples:
+            All QNMs of a leaky slab::
+
+                modes = ml.all_qnm_neff(omega, Polarization.TE)
+                for re, im in modes:
+                    print(f"Re(neff)={re:.4f}  Im(neff)={im:.4e}")
+        """
+
+    def leaky_neff(
+        self,
+        omega: float,
+        polarization: Polarization = Polarization.TE,
+        mode: int = 0,
+        re_range: tuple[float, float] | None = None,
+        im_range: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        """Find a single one-sided leaky mode effective index.
+
+        Uses **evanescent** (physical) boundary conditions on the left cladding
+        and **outgoing-wave** boundary conditions on the right cladding.  This is
+        the correct solver for structures where the mode is evanescently confined
+        on the low-index left side and radiates into a higher-index substrate on
+        the right.
+
+        Unlike :meth:`qnm_neff`, which applies outgoing-wave conditions on
+        **both** claddings (full quasi-normal mode), this solver keeps the left
+        cladding in the standard evanescent regime.  The resulting mode poles:
+
+        * Have ``Im(neff) > 0`` — with real ω and complex k∥ = neff·k₀,
+          ``Im(neff) > 0`` means the field decays as it propagates along the
+          waveguide (spatial decay, +x direction).
+        * Have ``Re(neff)`` close to the guided-mode value of the isolated core,
+          and **increasing** as the gap between core and substrate shrinks (more
+          substrate overlap → higher effective index).
+        * Have ``Im(neff)`` growing exponentially as the gap shrinks (stronger
+          tunnelling through the gap → faster spatial decay).
+
+        **Sign convention note:** :meth:`qnm_neff` uses complex ω at fixed real
+        k∥ (temporal decay → ``Im(neff) < 0``).  This solver uses real ω with
+        complex k∥ (spatial decay → ``Im(neff) > 0``).  The search rectangle
+        must therefore lie entirely in the **upper** half-plane (``im_min ≥ 0``).
+
+        Default search ranges (used when the corresponding argument is ``None``):
+
+        * **re_range**: ``(Re(n_min) + ε, Re(n_max) − ε)`` across all layers.
+        * **im_range**: ``(1e-3, 0.15)`` — entirely above the real axis.
+
+        Args:
+            omega: The angular frequency (real).
+            polarization: The polarization of the mode (TE or TM).
+            mode: Zero-based index into the list returned by
+                :meth:`all_leaky_neff`, sorted by descending ``Re(neff)``.
+            re_range: Optional ``(re_min, re_max)`` for the real part of ``neff``.
+            im_range: Optional ``(im_min, im_max)`` for the imaginary part of
+                ``neff``.  Must satisfy ``im_min ≥ 0``.  For weakly leaky modes
+                (large gap) use a shallower window such as ``(1e-8, 1e-3)``.
+
+        Returns:
+            ``(Re(neff), Im(neff))`` as a tuple with ``Im(neff) > 0``, or ``None``
+            if the requested mode index is out of range.
+
+        Examples:
+            Core mode leaking into a higher-index substrate::
+
+                layers = [
+                    Layer(1.0, 1.0),   # air cladding (left)
+                    Layer(2.0, 0.6),   # waveguide core
+                    Layer(1.0, 0.5),   # thin air gap
+                    Layer(2.2, 1.0),   # substrate (right, semi-infinite)
+                ]
+                ml = MultiLayer(layers)
+                re, im = ml.leaky_neff(omega)
+                # re ≈ isolated-core neff,  im > 0
+
+            Weakly leaky mode (large gap, small Im(neff))::
+
+                re, im = ml.leaky_neff(omega, im_range=(1e-8, 1e-3))
+        """
+
+    def all_leaky_neff(
+        self,
+        omega: float,
+        polarization: Polarization = Polarization.TE,
+        re_range: tuple[float, float] | None = None,
+        im_range: tuple[float, float] | None = None,
+    ) -> list[tuple[float, float]]:
+        """Return all one-sided leaky mode effective indices in the search rectangle.
+
+        Uses the same argument-principle / Muller-polisher pipeline as
+        :meth:`all_qnm_neff`, but with evanescent BC on the left cladding and
+        outgoing-wave BC on the right cladding.  All returned modes satisfy
+        ``Im(neff) > 0`` (spatial decay along the propagation direction at real ω).
+
+        Default search ranges are the same as :meth:`leaky_neff`.
+
+        Args:
+            omega: The angular frequency (real).
+            polarization: The polarization of the modes (TE or TM).
+            re_range: Optional ``(re_min, re_max)`` for ``Re(neff)``.
+            im_range: Optional ``(im_min, im_max)`` for ``Im(neff)``;
+                must satisfy ``im_min ≥ 0``.  Use a smaller lower bound such as
+                ``(1e-8, 1e-3)`` to capture weakly leaky modes (large gap).
+
+        Returns:
+            A list of ``(Re(neff), Im(neff))`` tuples sorted by descending
+            ``Re(neff)``.  All tuples satisfy ``Im(neff) > 0``.
+
+        Examples:
+            All leaky modes of a core-over-substrate slab::
+
+                modes = ml.all_leaky_neff(omega, Polarization.TE)
+                for re, im in modes:
+                    print(f"Re(neff)={re:.6f}  Im(neff)={im:.4e}")
+        """
+
     def index(self) -> IndexData:
         """Return the refractive index profile of the multilayer structure.
 
