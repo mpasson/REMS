@@ -17,9 +17,7 @@ use crate::enums::BoundaryCondition;
 use crate::enums::Normalization;
 use crate::enums::Polarization;
 use crate::layer::{Layer, LayerCoefficientVector, PEC};
-use crate::scattering_matrix::{
-    calculate_s_matrix, calculate_s_matrix_leaky_right, calculate_s_matrix_qnm,
-};
+use crate::scattering_matrix::{calculate_s_matrix, calculate_s_matrix_with_bc};
 use crate::transfer_matrix::TransferMatrix;
 use crate::transfer_matrix::{
     calculate_t_matrix, get_propagation_coefficients_pec_left,
@@ -485,24 +483,37 @@ impl MultiLayer {
             .unwrap_or_else(|_| FieldData::zeros(self.get_grid_data().xplot))
     }
 
-    /// Finds a single complex effective index using the 2-D complex-plane search.
+    /// Finds a single complex effective index in the complex neff plane.
+    ///
+    /// The boundary conditions used to build the S-matrix are controlled by the
+    /// `left_bc` / `right_bc` arguments (which override the boundary conditions
+    /// stored on the `MultiLayer` object for this call only).
+    ///
+    /// | `left_bc`    | `right_bc`   | Mode type                              |
+    /// |--------------|--------------|----------------------------------------|
+    /// | SemiInfinite | SemiInfinite | Guided / lossy guided (`Im ≈ 0`)       |
+    /// | Outgoing     | Outgoing     | Quasi-normal modes (`Im(neff) < 0`)    |
+    /// | SemiInfinite | Outgoing     | One-sided leaky modes (`Im(neff) > 0`) |
+    ///
+    /// The default `im_range` adapts automatically to the active boundary conditions:
+    /// - `SemiInfinite` + `SemiInfinite` → near-real window (symmetric for lossy, slightly
+    ///   asymmetric for lossless).
+    /// - `Outgoing` + `Outgoing` → lower half-plane `(-0.15, -1e-3)` for QNMs.
+    /// - One `Outgoing` → upper half-plane `(1e-3, 0.15)` for leaky modes.
     ///
     /// # Arguments
     /// * `omega`        - The angular frequency (real).
-    /// * `polarization` - The polarization of the mode (`Polarization.TE` or `TM`).
-    /// * `mode`         - Zero-based index into the list returned by
-    ///                    [`python_all_complex_neff`], sorted by descending `Re(neff)`.
-    /// * `re_range`     - Optional `(re_min, re_max)` for the real part of `neff`.
-    ///                    Defaults to `(Re(n_min), Re(n_max))` across all layers.
-    /// * `im_range`     - Optional `(im_min, im_max)` for the imaginary part of `neff`.
-    ///                    Defaults to a window scaled to the maximum material loss,
-    ///                    with a floor of ±[`MIN_IM_HALF_WIDTH`].
+    /// * `polarization` - `Polarization.TE` or `TM`.
+    /// * `mode`         - Zero-based mode index (sorted by descending `Re(neff)`).
+    /// * `re_range`     - Optional `(re_min, re_max)`.
+    /// * `im_range`     - Optional `(im_min, im_max)`.
+    /// * `left_bc`      - Optional BC override for the left cladding.
+    /// * `right_bc`     - Optional BC override for the right cladding.
     ///
     /// # Returns
-    /// `(Re(neff), Im(neff))` as a Python tuple, or `None` if the requested mode
-    /// index is out of range.
+    /// `(Re(neff), Im(neff))` or `None`.
     #[pyo3(name = "complex_neff")]
-    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None))]
+    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None, left_bc=None, right_bc=None))]
     pub fn python_complex_neff(
         &self,
         omega: f64,
@@ -510,209 +521,52 @@ impl MultiLayer {
         mode: Option<usize>,
         re_range: Option<(f64, f64)>,
         im_range: Option<(f64, f64)>,
+        left_bc: Option<BoundaryCondition>,
+        right_bc: Option<BoundaryCondition>,
     ) -> Option<(f64, f64)> {
         let polarization = polarization.unwrap_or(Polarization::TE);
         let mode = mode.unwrap_or(0);
-        let (re_range, im_range) = self.default_search_ranges(re_range, im_range);
-        let roots = self.solve_complex(omega, polarization, re_range, im_range);
+        let eff_left = left_bc.unwrap_or(self.left_bc);
+        let eff_right = right_bc.unwrap_or(self.right_bc);
+        let (re_range, im_range) =
+            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
+        let roots =
+            self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right);
         roots.get(mode).map(|c| (c.re, c.im))
     }
 
     /// Returns all complex effective indices found in the search rectangle.
     ///
+    /// Same boundary-condition logic as [`complex_neff`].  See that method's
+    /// documentation for the `left_bc` / `right_bc` parameter description.
+    ///
     /// # Arguments
     /// * `omega`        - The angular frequency (real).
     /// * `polarization` - The polarization of the modes.
-    /// * `re_range`     - Optional `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - Optional `(im_min, im_max)` for `Im(neff)`.
+    /// * `re_range`     - Optional `(re_min, re_max)`.
+    /// * `im_range`     - Optional `(im_min, im_max)`.
+    /// * `left_bc`      - Optional BC override for the left cladding.
+    /// * `right_bc`     - Optional BC override for the right cladding.
     ///
     /// # Returns
     /// A list of `(Re(neff), Im(neff))` tuples, sorted by descending `Re(neff)`.
     #[pyo3(name = "all_complex_neff")]
-    #[pyo3(signature = (omega, polarization=None, re_range=None, im_range=None))]
+    #[pyo3(signature = (omega, polarization=None, re_range=None, im_range=None, left_bc=None, right_bc=None))]
     pub fn python_all_complex_neff(
         &self,
         omega: f64,
         polarization: Option<Polarization>,
         re_range: Option<(f64, f64)>,
         im_range: Option<(f64, f64)>,
+        left_bc: Option<BoundaryCondition>,
+        right_bc: Option<BoundaryCondition>,
     ) -> Vec<(f64, f64)> {
         let polarization = polarization.unwrap_or(Polarization::TE);
-        let (re_range, im_range) = self.default_search_ranges(re_range, im_range);
-        self.solve_complex(omega, polarization, re_range, im_range)
-            .into_iter()
-            .map(|c| (c.re, c.im))
-            .collect()
-    }
-
-    /// Finds a single quasi-normal mode (QNM) effective index.
-    ///
-    /// QNMs satisfy **outgoing-wave** boundary conditions in both semi-infinite
-    /// cladding layers: the field radiates away from the structure rather than
-    /// decaying evanescently.  Their effective indices are complex with
-    /// `Im(neff) < 0` (the mode decays in time as energy leaks out).
-    ///
-    /// The solver uses the same argument-principle / Muller-polisher pipeline as
-    /// [`complex_neff`], but evaluates the S-matrix built with `kz_outgoing` on
-    /// the boundary layers.  The search rectangle should lie entirely in the lower
-    /// half-plane (`im_max ≤ 0`).
-    ///
-    /// Default search ranges (used when the corresponding argument is ``None``):
-    ///
-    /// * **re_range**: `(Re(n_min) + ε, Re(n_max) − ε)` across all layers.
-    /// * **im_range**: `(-0.5, -1e-3)` — entirely below the real axis.
-    ///
-    /// # Arguments
-    /// * `omega`        - The angular frequency (real).
-    /// * `polarization` - The polarization of the mode (`Polarization.TE` or `TM`).
-    /// * `mode`         - Zero-based index into the list returned by
-    ///                    [`all_qnm_neff`], sorted by descending `Re(neff)`.
-    /// * `re_range`     - Optional `(re_min, re_max)` for the real part of `neff`.
-    /// * `im_range`     - Optional `(im_min, im_max)` for the imaginary part of
-    ///                    `neff`; should satisfy `im_max ≤ 0`.
-    ///
-    /// # Returns
-    /// `(Re(neff), Im(neff))` as a Python tuple, or `None` if the requested mode
-    /// index is out of range.
-    #[pyo3(name = "qnm_neff")]
-    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None))]
-    pub fn python_qnm_neff(
-        &self,
-        omega: f64,
-        polarization: Option<Polarization>,
-        mode: Option<usize>,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> Option<(f64, f64)> {
-        let polarization = polarization.unwrap_or(Polarization::TE);
-        let mode = mode.unwrap_or(0);
-        let (re_range, im_range) = self.default_search_ranges_qnm(re_range, im_range);
-        let roots = self.solve_qnm(omega, polarization, re_range, im_range);
-        roots.get(mode).map(|c| (c.re, c.im))
-    }
-
-    /// Returns all quasi-normal mode (QNM) effective indices found in the search
-    /// rectangle.
-    ///
-    /// Uses the same argument-principle / Muller-polisher pipeline as
-    /// [`all_complex_neff`], but with outgoing-wave boundary conditions.
-    /// All returned modes satisfy `Im(neff) < 0`.
-    ///
-    /// Default search ranges are the same as [`qnm_neff`].
-    ///
-    /// # Arguments
-    /// * `omega`        - The angular frequency (real).
-    /// * `polarization` - The polarization of the modes.
-    /// * `re_range`     - Optional `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - Optional `(im_min, im_max)` for `Im(neff)`; should
-    ///                    satisfy `im_max ≤ 0`.
-    ///
-    /// # Returns
-    /// A list of `(Re(neff), Im(neff))` tuples sorted by descending `Re(neff)`.
-    #[pyo3(name = "all_qnm_neff")]
-    #[pyo3(signature = (omega, polarization=None, re_range=None, im_range=None))]
-    pub fn python_all_qnm_neff(
-        &self,
-        omega: f64,
-        polarization: Option<Polarization>,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> Vec<(f64, f64)> {
-        let polarization = polarization.unwrap_or(Polarization::TE);
-        let (re_range, im_range) = self.default_search_ranges_qnm(re_range, im_range);
-        self.solve_qnm(omega, polarization, re_range, im_range)
-            .into_iter()
-            .map(|c| (c.re, c.im))
-            .collect()
-    }
-
-    /// Finds a single one-sided leaky mode effective index.
-    ///
-    /// Uses **evanescent** (physical) boundary conditions on the left cladding and
-    /// **outgoing-wave** boundary conditions on the right cladding.  This is the
-    /// correct solver for structures where the mode is evanescently confined on the
-    /// low-index left side and radiates into a higher-index substrate on the right.
-    ///
-    /// The resulting modes have:
-    /// - `Im(neff) > 0` — the field decays as it propagates along the waveguide
-    ///   (+x direction with real ω, complex k∥ = neff·k₀).
-    /// - `Re(neff)` close to the guided-mode value of the isolated core, and
-    ///   **increasing** as the gap between core and substrate shrinks (more
-    ///   substrate overlap → higher effective index).
-    /// - `Im(neff)` growing exponentially as the gap shrinks (stronger tunnelling
-    ///   through the gap into the substrate).
-    ///
-    /// Note on sign convention: unlike [`python_qnm_neff`] which uses complex ω
-    /// (temporal decay → `Im(neff) < 0`), this solver uses real ω with complex k∥
-    /// (spatial decay → `Im(neff) > 0`).  The search rectangle must therefore lie
-    /// entirely in the **upper** half-plane (`im_min ≥ 0`).
-    ///
-    /// Default search ranges (used when the corresponding argument is `None`):
-    /// * `re_range`: `(Re(n_min) + ε, Re(n_max) − ε)` across all layers.
-    /// * `im_range`: `(1e-3, 0.15)` — entirely above the real axis.
-    ///
-    /// # Arguments
-    /// * `omega`        - The angular frequency (real).
-    /// * `polarization` - The polarization of the mode.
-    /// * `mode`         - Zero-based index into the list returned by
-    ///                    [`python_all_leaky_neff`], sorted by descending `Re(neff)`.
-    /// * `re_range`     - Optional `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - Optional `(im_min, im_max)` for `Im(neff)`;
-    ///                    should satisfy `im_min ≥ 0`.  Use a smaller lower bound
-    ///                    such as `(1e-7, 1e-3)` to capture weakly leaky modes
-    ///                    (large gap).
-    ///
-    /// # Returns
-    /// `(Re(neff), Im(neff))` as a Python tuple with `Im(neff) > 0`, or `None` if
-    /// the requested mode index is out of range.
-    #[pyo3(name = "leaky_neff")]
-    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None))]
-    pub fn python_leaky_neff(
-        &self,
-        omega: f64,
-        polarization: Option<Polarization>,
-        mode: Option<usize>,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> Option<(f64, f64)> {
-        let polarization = polarization.unwrap_or(Polarization::TE);
-        let mode = mode.unwrap_or(0);
-        let (re_range, im_range) = self.default_search_ranges_leaky_right(re_range, im_range);
-        let roots = self.solve_leaky_right(omega, polarization, re_range, im_range);
-        roots.get(mode).map(|c| (c.re, c.im))
-    }
-
-    /// Returns all one-sided leaky mode effective indices found in the search rectangle.
-    ///
-    /// Uses the same argument-principle / Muller-polisher pipeline as
-    /// [`python_all_qnm_neff`], but with evanescent BC on the left cladding and
-    /// outgoing-wave BC on the right cladding.  All returned modes satisfy
-    /// `Im(neff) > 0` (spatial decay along the propagation direction).
-    ///
-    /// Default search ranges are the same as [`python_leaky_neff`].
-    ///
-    /// # Arguments
-    /// * `omega`        - The angular frequency (real).
-    /// * `polarization` - The polarization of the modes.
-    /// * `re_range`     - Optional `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - Optional `(im_min, im_max)` for `Im(neff)`;
-    ///                    should satisfy `im_min ≥ 0`.
-    ///
-    /// # Returns
-    /// A list of `(Re(neff), Im(neff))` tuples sorted by descending `Re(neff)`.
-    /// All tuples satisfy `Im(neff) > 0`.
-    #[pyo3(name = "all_leaky_neff")]
-    #[pyo3(signature = (omega, polarization=None, re_range=None, im_range=None))]
-    pub fn python_all_leaky_neff(
-        &self,
-        omega: f64,
-        polarization: Option<Polarization>,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> Vec<(f64, f64)> {
-        let polarization = polarization.unwrap_or(Polarization::TE);
-        let (re_range, im_range) = self.default_search_ranges_leaky_right(re_range, im_range);
-        self.solve_leaky_right(omega, polarization, re_range, im_range)
+        let eff_left = left_bc.unwrap_or(self.left_bc);
+        let eff_right = right_bc.unwrap_or(self.right_bc);
+        let (re_range, im_range) =
+            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
+        self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right)
             .into_iter()
             .map(|c| (c.re, c.im))
             .collect()
@@ -741,11 +595,13 @@ impl MultiLayer {
     /// * `mode`         - Zero-based mode index (same ordering as [`python_complex_neff`]).
     /// * `re_range`     - Optional `(re_min, re_max)` forwarded to the complex-plane solver.
     /// * `im_range`     - Optional `(im_min, im_max)` forwarded to the complex-plane solver.
+    /// * `left_bc`      - Optional BC override for the left cladding.
+    /// * `right_bc`     - Optional BC override for the right cladding.
     /// # Returns
     /// A `FieldData` with all six field components on the standard plotting grid,
     /// or a zeroed `FieldData` if the requested mode does not exist.
     #[pyo3(name = "complex_field")]
-    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None))]
+    #[pyo3(signature = (omega, polarization=None, mode=None, re_range=None, im_range=None, left_bc=None, right_bc=None))]
     pub fn python_complex_field(
         &self,
         omega: f64,
@@ -753,11 +609,17 @@ impl MultiLayer {
         mode: Option<usize>,
         re_range: Option<(f64, f64)>,
         im_range: Option<(f64, f64)>,
+        left_bc: Option<BoundaryCondition>,
+        right_bc: Option<BoundaryCondition>,
     ) -> FieldData {
         let polarization = polarization.unwrap_or(Polarization::TE);
         let mode = mode.unwrap_or(0);
-        let (re_range, im_range) = self.default_search_ranges(re_range, im_range);
-        let roots = self.solve_complex(omega, polarization, re_range, im_range);
+        let eff_left = left_bc.unwrap_or(self.left_bc);
+        let eff_right = right_bc.unwrap_or(self.right_bc);
+        let (re_range, im_range) =
+            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
+        let roots =
+            self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right);
         match roots.get(mode) {
             Some(&neff) => self.field_complex(omega, polarization, neff),
             None => FieldData::zeros(self.get_grid_data().xplot),
@@ -829,7 +691,18 @@ impl MultiLayer {
             }
             BackEnd::Transfer => {
                 let t = calculate_t_matrix(&self.layers, k0c, kc, polarization);
-                match (self.left_bc, self.right_bc) {
+                // For the real-axis solver, Outgoing behaves the same as
+                // SemiInfinite (outgoing BCs are only meaningful for the
+                // complex-plane S-matrix solver).
+                let eff_left = match self.left_bc {
+                    BoundaryCondition::Outgoing => BoundaryCondition::SemiInfinite,
+                    bc => bc,
+                };
+                let eff_right = match self.right_bc {
+                    BoundaryCondition::Outgoing => BoundaryCondition::SemiInfinite,
+                    bc => bc,
+                };
+                match (eff_left, eff_right) {
                     (BoundaryCondition::SemiInfinite, BoundaryCondition::SemiInfinite) => {
                         1.0 / t.t22
                     }
@@ -856,42 +729,27 @@ impl MultiLayer {
                     (BoundaryCondition::PEC, BoundaryCondition::PEC) => {
                         panic!("Both-PEC boundary condition is not supported")
                     }
+                    // After Outgoing→SemiInfinite normalization these arms are
+                    // unreachable, but the compiler requires exhaustiveness.
+                    _ => 1.0 / t.t22,
                 }
             }
         }
     }
 
-    /// Evaluates `1 / det(S)` for a **complex** in-plane wavevector `k`.
-    ///
-    /// Used **only for the winding-number contour integral**.  Modes are
-    /// *zeros* of `det(S)`, hence *poles* of `1/det(S)`.  The argument
-    /// principle applied to `1/det(S)` gives `#zeros − #poles = −N_modes`,
-    /// and taking the absolute value recovers the mode count `N_modes`.
-    ///
-    /// Using the reciprocal (rather than `det(S)` itself) makes the argument
-    /// change around each pole large and spread-out, so a moderately coarse
-    /// contour sample still accumulates the full `±2π` contribution reliably.
-    ///
-    /// **Do not use this function as the objective for root polishing.**
-    /// It has poles (not zeros) at the mode locations; Muller's method would
-    /// converge to something that is not a mode.  Use [`det_s_complex`]
-    /// instead for polishing.
-    ///
-    /// # Arguments
-    /// * `k0`           - Vacuum wavevector (real).
-    /// * `k`            - Complex in-plane wavevector.
-    /// * `polarization` - Polarisation of the mode.
-    fn characteristic_function_complex(
+    /// Evaluates `1 / det(S)` for a complex in-plane wavevector `k`,
+    /// using boundary conditions specified by `left_bc` and `right_bc`.
+    fn characteristic_function_with_bc(
         &self,
         k0: f64,
         k: Complex<f64>,
         polarization: Polarization,
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
     ) -> Complex<f64> {
         let k0c = Complex::new(k0, 0.0);
-        // Always use the scattering matrix for complex k: it is unconditionally
-        // stable because phase factors never overflow.
-        let det = calculate_s_matrix(&self.layers, k0c, k, polarization).determinant();
-        // Guard against division by exactly zero (should not happen off-mode).
+        let det = calculate_s_matrix_with_bc(&self.layers, k0c, k, polarization, left_bc, right_bc)
+            .determinant();
         if det.norm() < 1e-300 {
             Complex::new(1e300, 0.0)
         } else {
@@ -985,58 +843,44 @@ impl MultiLayer {
 
     // ── Complex-plane mode search ─────────────────────────────────────────────
 
-    /// Computes the default search ranges for the complex-plane solver.
+    /// Returns the default search rectangle for the complex-plane solver,
+    /// adapting the `im_range` to the active boundary conditions.
     ///
-    /// * `re_range`: `(Re(n_min), Re(n_max))` across all layers — identical to the
-    ///   real-axis solver, automatically spans both guided and leaky regimes.
-    /// * `im_range`: For **lossy** structures (`max |Im(n_j)| > 0`) the imaginary
-    ///   window is symmetric: `(-w, +w)` where `w = max(|Im(n_j)|, MIN_IM_HALF_WIDTH)`.
-    ///   For **lossless** structures all modes sit at `Im(neff) ≈ 0` (guided) or
-    ///   at a tiny positive imaginary part (quasi-guided / leaky).  The
-    ///   characteristic function `1/det(S)` has branch cuts in the *upper*
-    ///   half-plane (arising from the `kz_physical` sign convention), so using a
-    ///   symmetric window causes the winding-number contour to traverse these
-    ///   branch cuts and produce an unreliable mode count.  Instead we use an
-    ///   **asymmetric** window: `(-MIN_IM_LOWER, +MIN_IM_HALF_WIDTH)`.  The small
-    ///   negative lower bound keeps the bottom edge very close to the real axis
-    ///   (where the mode poles live), while the moderate positive upper bound
-    ///   gives the contour enough room above the real axis to capture the full
-    ///   `2π` winding.  The vertical sides of the rectangle cross the real axis
-    ///   only over the tiny `MIN_IM_LOWER` interval, minimising the arc-length
-    ///   exposed to the branch-cut region.
-    fn default_search_ranges(
+    /// * Both `SemiInfinite` or `PEC`: near-real window (symmetric for lossy,
+    ///   slightly asymmetric for lossless structures).
+    /// * Both `Outgoing` (QNM): `(-QNM_IM_DEFAULT_DEPTH, QNM_IM_DEFAULT_MAX)`.
+    /// * One `Outgoing` (one-sided leaky): `(MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH)`.
+    fn default_search_ranges_for_bc(
         &self,
         re_range: Option<(f64, f64)>,
         im_range: Option<(f64, f64)>,
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
     ) -> ((f64, f64), (f64, f64)) {
         let re = re_range.unwrap_or_else(|| {
             let (min_n, max_n) = self.find_minmax_n();
-            // Pull the real-axis bounds slightly inward so the contour never
-            // lands exactly on n_min or n_max, where kz = 0 in some layer and
-            // the S-matrix compose denominator (1 − s12·s21) can hit zero,
-            // producing NaN and corrupting the winding-number integral.
             let margin = 1e-6;
             (min_n + margin, max_n - margin)
         });
-        let im = im_range.unwrap_or_else(|| {
-            let max_im = self
-                .layers
-                .iter()
-                .map(|l| l.n.im.abs())
-                .fold(0.0_f64, f64::max);
-            if max_im > 0.0 {
-                // Lossy structure: symmetric window around the real axis.
-                let half_w = max_im.max(MIN_IM_HALF_WIDTH);
-                (-half_w, half_w)
-            } else {
-                // Lossless structure: asymmetric window.
-                // The bottom edge is kept very close to the real axis
-                // (only MIN_IM_LOWER below it) so the vertical sides spend
-                // minimal time in the branch-cut-contaminated upper half-plane.
-                // The top edge is set to MIN_IM_HALF_WIDTH, giving enough room
-                // for the contour to accumulate the full 2π winding around the
-                // near-real-axis mode poles.
-                (-MIN_IM_LOWER, MIN_IM_HALF_WIDTH)
+        let im = im_range.unwrap_or_else(|| match (left_bc, right_bc) {
+            (BoundaryCondition::Outgoing, BoundaryCondition::Outgoing) => {
+                (-QNM_IM_DEFAULT_DEPTH, QNM_IM_DEFAULT_MAX)
+            }
+            (BoundaryCondition::Outgoing, _) | (_, BoundaryCondition::Outgoing) => {
+                (MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH)
+            }
+            _ => {
+                let max_im = self
+                    .layers
+                    .iter()
+                    .map(|l| l.n.im.abs())
+                    .fold(0.0_f64, f64::max);
+                if max_im > 0.0 {
+                    let half_w = max_im.max(MIN_IM_HALF_WIDTH);
+                    (-half_w, half_w)
+                } else {
+                    (-MIN_IM_LOWER, MIN_IM_HALF_WIDTH)
+                }
             }
         });
         (re, im)
@@ -1410,27 +1254,27 @@ impl MultiLayer {
         polarization: Polarization,
         re_range: (f64, f64),
         im_range: (f64, f64),
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
     ) -> Vec<Complex<f64>> {
-        let char_fn = |k: Complex<f64>| self.characteristic_function_complex(k0, k, polarization);
+        let char_fn = |k: Complex<f64>| {
+            self.characteristic_function_with_bc(k0, k, polarization, left_bc, right_bc)
+        };
         let mut roots: Vec<Complex<f64>> = Vec::new();
         self.find_zeros_in_rectangle(
             k0, re_range.0, re_range.1, im_range.0, im_range.1, 0, &mut roots, &char_fn,
         );
 
-        // For lossless structures, supplement with the real-axis solver.
-        // Modes that sit exactly on the real axis (Im(neff) = 0) correspond to
-        // poles of 1/det(S) *on* the contour boundary when im_min < 0 < im_max,
-        // which makes the winding-number integral ill-conditioned.  The real-axis
-        // solver finds these modes exactly and reliably.
+        // Supplement with real-axis solver only for lossless structures with both
+        // claddings using physical (non-outgoing) boundary conditions.
+        let both_physical = !matches!(left_bc, BoundaryCondition::Outgoing)
+            && !matches!(right_bc, BoundaryCondition::Outgoing);
         let all_lossless = self.layers.iter().all(|l| l.n.im == 0.0);
-        if all_lossless {
+        if all_lossless && both_physical {
             let real_modes = self.solve(k0, polarization);
             for neff_re in real_modes {
-                // Only include modes whose Re(neff) falls inside the search rectangle.
                 if neff_re >= re_range.0 && neff_re <= re_range.1 {
                     let k_real = Complex::new(neff_re * k0, 0.0);
-                    // De-duplicate: skip if the complex solver already found a root
-                    // very close to this real-axis value.
                     let is_duplicate = roots.iter().any(|&r| (r - k_real).norm() < 1e-6 * k0);
                     if !is_duplicate {
                         roots.push(k_real);
@@ -1439,9 +1283,7 @@ impl MultiLayer {
             }
         }
 
-        // Convert from wavevector k to neff = k / k0.
         let mut neff_roots: Vec<Complex<f64>> = roots.iter().map(|&k| k / k0).collect();
-        // Sort by descending real part.
         neff_roots.sort_by(|a, b| b.re.partial_cmp(&a.re).unwrap_or(Ordering::Equal));
         neff_roots
     }
@@ -1454,8 +1296,10 @@ impl MultiLayer {
         mode: usize,
         re_range: (f64, f64),
         im_range: (f64, f64),
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
     ) -> Result<Complex<f64>, String> {
-        let solutions = self.solve_complex(k0, polarization, re_range, im_range);
+        let solutions = self.solve_complex(k0, polarization, re_range, im_range, left_bc, right_bc);
         match solutions.get(mode) {
             Some(&n) => Ok(n),
             None => Err(format!(
@@ -1465,200 +1309,6 @@ impl MultiLayer {
                 solutions.len().saturating_sub(1)
             )),
         }
-    }
-
-    // ── Quasi-normal mode (QNM) solver ───────────────────────────────────────
-
-    /// Evaluates `1 / det(S_qnm)` for a **complex** in-plane wavevector `k`.
-    ///
-    /// Uses [`calculate_s_matrix_qnm`], which applies outgoing-wave boundary
-    /// conditions (`kz_outgoing`) on the first and last cladding layers.  The poles
-    /// of `1/det(S_qnm)` — i.e. the zeros of `det(S_qnm)` — are the quasi-normal
-    /// mode eigenvalues, which live in the lower half of the complex `neff` plane
-    /// (`Im(neff) < 0`).
-    fn characteristic_function_qnm(
-        &self,
-        k0: f64,
-        k: Complex<f64>,
-        polarization: Polarization,
-    ) -> Complex<f64> {
-        let k0c = Complex::new(k0, 0.0);
-        let det = calculate_s_matrix_qnm(&self.layers, k0c, k, polarization).determinant();
-        if det.norm() < 1e-300 {
-            Complex::new(1e300, 0.0)
-        } else {
-            Complex::new(1.0, 0.0) / det
-        }
-    }
-
-    /// Returns the default search rectangle for the QNM solver.
-    ///
-    /// * `re_range`: `(Re(n_min) + ε, Re(n_max) − ε)` — same as the standard
-    ///   complex solver.
-    /// * `im_range`: `(-QNM_IM_DEFAULT_DEPTH, -MIN_IM_LOWER)` — placed entirely
-    ///   in the lower half-plane, staying away from the real axis where branch-cut
-    ///   artefacts are most severe.
-    fn default_search_ranges_qnm(
-        &self,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> ((f64, f64), (f64, f64)) {
-        let re = re_range.unwrap_or_else(|| {
-            let (min_n, max_n) = self.find_minmax_n();
-            let margin = 1e-6;
-            (min_n + margin, max_n - margin)
-        });
-        let im = im_range.unwrap_or((-QNM_IM_DEFAULT_DEPTH, QNM_IM_DEFAULT_MAX));
-        (re, im)
-    }
-
-    /// Returns the default search rectangle for the one-sided leaky mode solver.
-    ///
-    /// Unlike the QNM solver, leaky-right poles live in the **upper** half of the
-    /// complex `neff` plane (`Im(neff) > 0`): with real ω and complex k∥ = neff·k₀,
-    /// `Im(neff) > 0` means the field decays as it propagates along the waveguide.
-    ///
-    /// * `re_range`: `(Re(n_min) + ε, Re(n_max) − ε)` — same as all other solvers.
-    /// * `im_range`: `(MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH)` — the mirror of the QNM
-    ///   window about the real axis, placed entirely in the upper half-plane.
-    fn default_search_ranges_leaky_right(
-        &self,
-        re_range: Option<(f64, f64)>,
-        im_range: Option<(f64, f64)>,
-    ) -> ((f64, f64), (f64, f64)) {
-        let re = re_range.unwrap_or_else(|| {
-            let (min_n, max_n) = self.find_minmax_n();
-            let margin = 1e-6;
-            (min_n + margin, max_n - margin)
-        });
-        // Default: mirror of QNM window about the real axis.
-        let im = im_range.unwrap_or((MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH));
-        (re, im)
-    }
-
-    /// Finds all quasi-normal mode (QNM) effective indices in the given search rectangle.
-    ///
-    /// Uses the same argument-principle winding-number / Muller-polisher pipeline as
-    /// [`solve_complex`], but evaluates [`characteristic_function_qnm`] — built with
-    /// outgoing-wave boundary conditions — instead of the standard
-    /// [`characteristic_function_complex`].
-    ///
-    /// QNM poles live in the **lower** half of the complex `neff` plane
-    /// (`Im(neff) < 0`).  The search rectangle should therefore have
-    /// `im_max ≤ 0`; in particular the default window
-    /// `(-QNM_IM_DEFAULT_DEPTH, -MIN_IM_LOWER)` keeps the contour entirely below the
-    /// real axis, avoiding the branch-cut artefacts that afflict the standard solver
-    /// near `Im(neff) = 0`.
-    ///
-    /// # Arguments
-    /// * `k0`           - Vacuum wavevector (real).
-    /// * `polarization` - Polarisation.
-    /// * `re_range`     - `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - `(im_min, im_max)` for `Im(neff)`; should satisfy `im_max ≤ 0`.
-    ///
-    /// # Returns
-    /// Complex effective indices sorted by descending `Re(neff)`.
-    pub fn solve_qnm(
-        &self,
-        k0: f64,
-        polarization: Polarization,
-        re_range: (f64, f64),
-        im_range: (f64, f64),
-    ) -> Vec<Complex<f64>> {
-        let char_fn = |k: Complex<f64>| self.characteristic_function_qnm(k0, k, polarization);
-        let mut roots: Vec<Complex<f64>> = Vec::new();
-        self.find_zeros_in_rectangle(
-            k0, re_range.0, re_range.1, im_range.0, im_range.1, 0, &mut roots, &char_fn,
-        );
-        let mut neff_roots: Vec<Complex<f64>> = roots.iter().map(|&k| k / k0).collect();
-        neff_roots.sort_by(|a, b| b.re.partial_cmp(&a.re).unwrap_or(Ordering::Equal));
-        neff_roots
-    }
-
-    /// Returns the QNM effective index of a single mode.
-    pub fn qnm_neff(
-        &self,
-        k0: f64,
-        polarization: Polarization,
-        mode: usize,
-        re_range: (f64, f64),
-        im_range: (f64, f64),
-    ) -> Result<Complex<f64>, String> {
-        let solutions = self.solve_qnm(k0, polarization, re_range, im_range);
-        match solutions.get(mode) {
-            Some(&n) => Ok(n),
-            None => Err(format!(
-                "QNM mode {} not found. Only {} modes (0->{}) available.",
-                mode,
-                solutions.len(),
-                solutions.len().saturating_sub(1)
-            )),
-        }
-    }
-
-    // ── One-sided leaky mode solver ───────────────────────────────────────────
-
-    /// Evaluates `1 / det(S_leaky)` where `S_leaky` is the S-matrix built with
-    /// **evanescent** (physical) boundary conditions on the left cladding and
-    /// **outgoing-wave** boundary conditions on the right cladding.
-    ///
-    /// Poles of this function — zeros of `det(S_leaky)` — are the one-sided
-    /// leaky mode eigenvalues.  They live in the upper half-plane (`Im(neff) > 0`,
-    /// spatial decay along the waveguide) and their real part stays close to the
-    /// guided-mode value of the isolated core.
-    fn characteristic_function_leaky_right(
-        &self,
-        k0: f64,
-        k: Complex<f64>,
-        polarization: Polarization,
-    ) -> Complex<f64> {
-        let k0c = Complex::new(k0, 0.0);
-        let det = calculate_s_matrix_leaky_right(&self.layers, k0c, k, polarization).determinant();
-        if det.norm() < 1e-300 {
-            Complex::new(1e300, 0.0)
-        } else {
-            Complex::new(1.0, 0.0) / det
-        }
-    }
-
-    /// Finds all one-sided leaky mode effective indices in the given search rectangle.
-    ///
-    /// Uses the same argument-principle winding-number / Muller-polisher pipeline as
-    /// [`solve_qnm`], but evaluates [`characteristic_function_leaky_right`] — built
-    /// with `kz_physical` on the left cladding and `kz_outgoing` on the right cladding.
-    ///
-    /// This is the correct solver for structures where the mode is evanescently
-    /// confined on the low-index side (left) and radiates into a higher-index
-    /// substrate on the right.  The resulting poles:
-    /// - Have `Im(neff) > 0` (spatial decay along the waveguide at real ω).
-    /// - Have `Re(neff)` close to the isolated-core guided-mode value, increasing
-    ///   as the gap between core and substrate shrinks (more substrate overlap).
-    /// - Have `Im(neff)` increasing exponentially as the gap shrinks.
-    ///
-    /// # Arguments
-    /// * `k0`           - Vacuum wavevector (real).
-    /// * `polarization` - Polarisation.
-    /// * `re_range`     - `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - `(im_min, im_max)` for `Im(neff)`; should satisfy `im_max ≤ 0`.
-    ///
-    /// # Returns
-    /// Complex effective indices sorted by descending `Re(neff)`.
-    pub fn solve_leaky_right(
-        &self,
-        k0: f64,
-        polarization: Polarization,
-        re_range: (f64, f64),
-        im_range: (f64, f64),
-    ) -> Vec<Complex<f64>> {
-        let char_fn =
-            |k: Complex<f64>| self.characteristic_function_leaky_right(k0, k, polarization);
-        let mut roots: Vec<Complex<f64>> = Vec::new();
-        self.find_zeros_in_rectangle(
-            k0, re_range.0, re_range.1, im_range.0, im_range.1, 0, &mut roots, &char_fn,
-        );
-        let mut neff_roots: Vec<Complex<f64>> = roots.iter().map(|&k| k / k0).collect();
-        neff_roots.sort_by(|a, b| b.re.partial_cmp(&a.re).unwrap_or(Ordering::Equal));
-        neff_roots
     }
 
     // ── Propagation coefficients ──────────────────────────────────────────────
@@ -1679,7 +1329,7 @@ impl MultiLayer {
                 BoundaryCondition::PEC => {
                     get_propagation_coefficients_pec_left(&self.layers, k0c, kc, polarization, a, b)
                 }
-                BoundaryCondition::SemiInfinite => {
+                BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => {
                     get_propagation_coefficients_transfer(&self.layers, k0c, kc, polarization, a, b)
                 }
             },
@@ -1694,7 +1344,7 @@ impl MultiLayer {
     /// Calculates the plotting grid data for the multilayer.
     fn get_grid_data(&self) -> GridData {
         let xstart = match self.left_bc {
-            BoundaryCondition::SemiInfinite => -self.layers[0].d,
+            BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => -self.layers[0].d,
             BoundaryCondition::PEC => 0.0,
         };
         let xend = self.layers.iter().map(|l| l.d).sum::<f64>() + xstart;
@@ -1816,7 +1466,9 @@ impl MultiLayer {
         };
 
         let (init_a, init_b) = match self.left_bc {
-            BoundaryCondition::SemiInfinite => (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)),
+            BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => {
+                (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0))
+            }
             BoundaryCondition::PEC => (Complex::new(1.0, 0.0), Complex::new(-1.0, 0.0)),
         };
         let mut coefficient_vector = self.get_propagation_coefficients(
@@ -1829,7 +1481,7 @@ impl MultiLayer {
         let grid_data = self.get_grid_data();
 
         match self.right_bc {
-            BoundaryCondition::SemiInfinite => {
+            BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => {
                 let last_coefficient = coefficient_vector.pop().unwrap();
                 coefficient_vector.push(LayerCoefficientVector {
                     a: last_coefficient.a,
@@ -1910,7 +1562,9 @@ impl MultiLayer {
         let k = neff * k0;
 
         let (init_a, init_b) = match self.left_bc {
-            BoundaryCondition::SemiInfinite => (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)),
+            BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => {
+                (Complex::new(0.0, 0.0), Complex::new(1.0, 0.0))
+            }
             BoundaryCondition::PEC => (Complex::new(1.0, 0.0), Complex::new(-1.0, 0.0)),
         };
 
@@ -2244,7 +1898,14 @@ mod tests {
         ]);
         let om = 2.0 * PI / 1.55;
         // Find the complex neff.
-        let roots = slab.solve_complex(om, Polarization::TE, (1.0, 2.0), (-0.05, 0.05));
+        let roots = slab.solve_complex(
+            om,
+            Polarization::TE,
+            (1.0, 2.0),
+            (-0.05, 0.05),
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
         assert!(!roots.is_empty(), "No complex mode found");
         let neff = roots[0];
         let field = slab.field_complex(om, Polarization::TE, neff);
@@ -2554,6 +2215,8 @@ mod tests {
                 Polarization::TE,
                 (re_mode - 0.05, re_mode + 0.05),
                 (-0.05, 0.05),
+                BoundaryCondition::SemiInfinite,
+                BoundaryCondition::SemiInfinite,
             );
             assert!(
                 !complex_modes.is_empty(),
@@ -2597,6 +2260,8 @@ mod tests {
                 Polarization::TE,
                 (re_mode - 0.05, re_mode + 0.05),
                 (-0.05, 0.05),
+                BoundaryCondition::SemiInfinite,
+                BoundaryCondition::SemiInfinite,
             );
             for mode in &complex_modes {
                 assert!(
@@ -2630,8 +2295,14 @@ mod tests {
             Layer::from_real(1.0, 1.0),
         ]);
 
-        let complex_modes =
-            slab_lossy.solve_complex(om, Polarization::TE, (1.0, 2.0), (-0.05, 0.05));
+        let complex_modes = slab_lossy.solve_complex(
+            om,
+            Polarization::TE,
+            (1.0, 2.0),
+            (-0.05, 0.05),
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
 
         assert!(!complex_modes.is_empty(), "Lossy slab: no modes found");
 
@@ -2656,8 +2327,15 @@ mod tests {
         let slab = create_slab_multilayer();
         let om = 2.0 * PI / 1.55;
         // Rectangle well away from any mode.
-        let char_fn =
-            |k: Complex<f64>| slab.characteristic_function_complex(om, k, Polarization::TE);
+        let char_fn = |k: Complex<f64>| {
+            slab.characteristic_function_with_bc(
+                om,
+                k,
+                Polarization::TE,
+                BoundaryCondition::SemiInfinite,
+                BoundaryCondition::SemiInfinite,
+            )
+        };
         let wn = slab.winding_number(om, 0.5, 0.6, -0.001, 0.001, 32, &char_fn);
         assert_eq!(wn, 0, "Winding number should be 0 for empty rectangle");
     }
@@ -2670,8 +2348,15 @@ mod tests {
         let om = 2.0 * PI / 1.55;
         let neff0 = slab.neff(om, Polarization::TE, 0).unwrap();
         // Tight box around the fundamental mode.
-        let char_fn =
-            |k: Complex<f64>| slab.characteristic_function_complex(om, k, Polarization::TE);
+        let char_fn = |k: Complex<f64>| {
+            slab.characteristic_function_with_bc(
+                om,
+                k,
+                Polarization::TE,
+                BoundaryCondition::SemiInfinite,
+                BoundaryCondition::SemiInfinite,
+            )
+        };
         let wn = slab.winding_number(om, neff0 - 0.01, neff0 + 0.01, -0.001, 0.001, 64, &char_fn);
         // winding_number already returns the absolute value, so expect +1.
         assert_eq!(wn, 1, "Winding number should be 1 for one enclosed mode");
@@ -2736,7 +2421,13 @@ mod tests {
         let om = 2.0 * PI / 1.55;
         // A point far from any mode.
         let k_test = Complex::new(0.5 * om, -0.05 * om);
-        let val = slab.characteristic_function_qnm(om, k_test, Polarization::TE);
+        let val = slab.characteristic_function_with_bc(
+            om,
+            k_test,
+            Polarization::TE,
+            BoundaryCondition::Outgoing,
+            BoundaryCondition::Outgoing,
+        );
         assert!(
             val.re.is_finite() && val.im.is_finite(),
             "QNM char fn should be finite off-mode, got {val}"
@@ -2758,11 +2449,13 @@ mod tests {
         // that appear for very deep (im_min < -0.35) or very thin rectangles.
         let slab = create_leaky_slab(0.5);
         let om = 2.0 * PI / 1.55;
-        let modes = slab.solve_qnm(
+        let modes = slab.solve_complex(
             om,
             Polarization::TE,
             (1.0 + 1e-6, 2.2 - 1e-6),
             (-0.15, -1e-3),
+            BoundaryCondition::Outgoing,
+            BoundaryCondition::Outgoing,
         );
         assert!(
             !modes.is_empty(),
@@ -2788,11 +2481,13 @@ mod tests {
     fn test_qnm_solver_symmetric_slab_modes_have_negative_im() {
         let slab = create_slab_multilayer(); // air / n=2 core / air
         let om = 2.0 * PI / 1.55;
-        let modes = slab.solve_qnm(
+        let modes = slab.solve_complex(
             om,
             Polarization::TE,
             (1.0 + 1e-6, 2.0 - 1e-6),
             (-0.5, -1e-3),
+            BoundaryCondition::Outgoing,
+            BoundaryCondition::Outgoing,
         );
         // We may or may not find modes in this range, but any found mode must
         // satisfy Im(neff) ≤ 0.
@@ -2823,7 +2518,14 @@ mod tests {
         let mut prev_im: Option<f64> = None;
         for &t in &gaps {
             let slab = create_leaky_slab(t);
-            let modes = slab.solve_qnm(om, Polarization::TE, re_range, im_range);
+            let modes = slab.solve_complex(
+                om,
+                Polarization::TE,
+                re_range,
+                im_range,
+                BoundaryCondition::Outgoing,
+                BoundaryCondition::Outgoing,
+            );
             if let Some(neff) = modes.first() {
                 let im = neff.im;
                 assert!(im < 0.0, "Im(neff) must be < 0 for gap t={t}, got {im:.6e}");

@@ -6,19 +6,17 @@ Physics
 -------
 Because n_substrate (2.2) > n_core (2.0), the core mode has no truly guided
 solution: it is evanescently confined on the *left* (air, n=1.0) but radiates
-into the *right* substrate.  The correct solver for this situation is
-``leaky_neff`` / ``all_leaky_neff``, which uses:
+into the *right* substrate.  The correct solver for this situation uses:
 
     left cladding  (air, n=1.0)      → kz_physical  (evanescent decay)
     right cladding (substrate, n=2.2) → kz_outgoing  (outgoing radiation)
 
-Why NOT qnm_neff
-~~~~~~~~~~~~~~~~
-``qnm_neff`` applies kz_outgoing on *both* claddings (full quasi-normal mode).
-For the left air cladding where Re(neff) > n_air = 1.0, kz_outgoing flips the
-sign of Im(kz), turning evanescent decay into an exponential *growth* to the
-left.  This shifts the pole from Re ≈ 1.804 down to Re ≈ 1.527, far from the
-guided-mode value, and gives the wrong Re-vs-gap trend.
+With the unified API, this is achieved by setting the right boundary condition
+to ``BoundaryCondition.Outgoing`` (either on the MultiLayer object or as a
+per-call override to ``complex_neff``).
+
+Formerly these were separate ``leaky_neff`` / ``all_leaky_neff`` methods;  now
+they are just ``complex_neff`` / ``all_complex_neff`` with ``right_bc=Outgoing``.
 
 Sign convention
 ~~~~~~~~~~~~~~~
@@ -72,6 +70,8 @@ from remsol import Polarization as pol
 OMEGA = 2.0 * math.pi / 1.55  # k0 at λ = 1.55 µm  [rad/µm]
 
 GAP_THICKNESSES = [
+    0.05,
+    0.1,
     0.2,
     0.3,
     0.5,
@@ -110,8 +110,12 @@ STAGE2_WIN = (1e-8, 0.01)
 
 
 def make_multilayer(t: float) -> remsol.MultiLayer:
-    """Build the leaky slab for a given air-gap thickness t [µm]."""
-    return remsol.MultiLayer(
+    """Build the leaky slab for a given air-gap thickness t [µm].
+
+    The right boundary is set to Outgoing so that ``complex_neff`` uses the
+    one-sided leaky boundary condition automatically.
+    """
+    ml = remsol.MultiLayer(
         [
             remsol.Layer(n=1.0, d=1.0),  # air cladding (left, semi-infinite)
             remsol.Layer(n=2.0, d=0.6),  # waveguide core
@@ -119,27 +123,27 @@ def make_multilayer(t: float) -> remsol.MultiLayer:
             remsol.Layer(n=2.2, d=1.0),  # substrate (right, semi-infinite)
         ]
     )
+    ml.set_right_boundary(remsol.BoundaryCondition.Outgoing)
+    return ml
 
 
 def find_te0_leaky(ml: remsol.MultiLayer) -> tuple[float, float] | None:
     """
     Two-stage search for the TE0 one-sided leaky mode.
 
-    Returns ``(Re(neff), Im(neff))`` with ``Im(neff) > 0``, or ``None`` if
+    Uses ``complex_neff`` with the right boundary condition already set to
+    ``Outgoing`` on the MultiLayer object.  Returns
+    ``(Re(neff), Im(neff))`` with ``Im(neff) > 0``, or ``None`` if
     the imaginary part is below the search floor (``Im < ~1e-11``).
-
-    Stage 1 uses a broad re_range to find strongly and moderately leaky modes.
-    Stage 2 uses a tight re_range + wide im window to catch weakly leaky modes.
-    Both stages return only roots with Im > 0 (physical spatial-decay branch).
     """
     # Stage 1: re_range = (1.7, 2.0), cascade of three im windows.
     for win in STAGE1_WINDOWS:
-        r = ml.leaky_neff(OMEGA, pol.TE, re_range=STAGE1_RE, im_range=win)
+        r = ml.complex_neff(OMEGA, pol.TE, re_range=STAGE1_RE, im_range=win)
         if r is not None and r[1] > 0:
             return r
 
     # Stage 2: very tight re_range, wide im window.
-    r = ml.leaky_neff(OMEGA, pol.TE, re_range=STAGE2_RE, im_range=STAGE2_WIN)
+    r = ml.complex_neff(OMEGA, pol.TE, re_range=STAGE2_RE, im_range=STAGE2_WIN)
     if r is not None and r[1] > 0:
         return r
 

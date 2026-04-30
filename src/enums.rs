@@ -36,6 +36,9 @@ pub enum BoundaryCondition {
     SemiInfinite,
     /// Perfect Electric Conductor (PEC) boundary condition: the tangential electric field vanishes at the boundary.
     PEC,
+    /// Outgoing-wave (radiating) boundary condition: the field propagates outward.
+    /// Use on one or both claddings to find leaky modes or QNMs via the complex solver.
+    Outgoing,
 }
 
 /// Enum for choosing the field normalization convention.

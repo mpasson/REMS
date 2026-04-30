@@ -19,6 +19,7 @@ extern crate num_complex;
 use itertools::izip;
 use num_complex::Complex;
 
+use crate::enums::BoundaryCondition;
 use crate::enums::Polarization;
 use crate::layer::Layer;
 use crate::transfer_matrix::{kz_outgoing, kz_physical};
@@ -445,6 +446,74 @@ pub fn calculate_s_matrix_leaky_right(
         let intf = if i + 1 == n_pairs {
             let kz_left = kz_physical(k0, layer1.n, k);
             let kz_right = kz_outgoing(k0, layer2.n, k);
+            ScatteringMatrix::matrix_interface_from_kz(
+                layer1.n,
+                layer2.n,
+                kz_left,
+                kz_right,
+                polarization,
+            )
+        } else {
+            ScatteringMatrix::matrix_interface(layer1.n, layer2.n, k0, k, polarization)
+        };
+        result = result.compose(intf);
+    }
+
+    result
+}
+
+/// Calculates the scattering matrix with configurable boundary conditions.
+///
+/// | `left_bc`    | `right_bc`   | Mode type                            |
+/// |--------------|--------------|--------------------------------------|
+/// | SemiInfinite | SemiInfinite | Guided modes (`Im(neff) ≈ 0`)        |
+/// | Outgoing     | Outgoing     | Quasi-normal modes (`Im(neff) < 0`)  |
+/// | SemiInfinite | Outgoing     | One-sided leaky (`Im(neff) > 0`)     |
+/// | Outgoing     | SemiInfinite | One-sided leaky (mirrored)           |
+///
+/// `PEC` is treated identically to `SemiInfinite` (wall BCs do not apply to
+/// the S-matrix; the complex solver always uses the S-matrix).
+pub fn calculate_s_matrix_with_bc(
+    layers: &[Layer],
+    k0: Complex<f64>,
+    k: Complex<f64>,
+    polarization: Polarization,
+    left_bc: BoundaryCondition,
+    right_bc: BoundaryCondition,
+) -> ScatteringMatrix {
+    debug_assert!(layers.len() >= 2, "S-matrix requires at least 2 layers");
+
+    let kz_for_bc = |n: Complex<f64>, bc: BoundaryCondition| -> Complex<f64> {
+        match bc {
+            BoundaryCondition::Outgoing => kz_outgoing(k0, n, k),
+            _ => kz_physical(k0, n, k),
+        }
+    };
+
+    let kz0 = kz_for_bc(layers[0].n, left_bc);
+    let kz1 = if layers.len() == 2 {
+        kz_for_bc(layers[1].n, right_bc)
+    } else {
+        kz_physical(k0, layers[1].n, k)
+    };
+    let mut result = ScatteringMatrix::matrix_interface_from_kz(
+        layers[0].n,
+        layers[1].n,
+        kz0,
+        kz1,
+        polarization,
+    );
+
+    let pairs: Vec<_> = layers.windows(2).skip(1).collect();
+    let n_pairs = pairs.len();
+    for (i, window) in pairs.iter().enumerate() {
+        let layer1 = &window[0];
+        let layer2 = &window[1];
+        let prop = ScatteringMatrix::matrix_propagation(layer1.n, layer1.d, k0, k);
+        result = result.compose(prop);
+        let intf = if i + 1 == n_pairs {
+            let kz_left = kz_physical(k0, layer1.n, k);
+            let kz_right = kz_for_bc(layer2.n, right_bc);
             ScatteringMatrix::matrix_interface_from_kz(
                 layer1.n,
                 layer2.n,

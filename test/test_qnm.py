@@ -1,9 +1,13 @@
-"""Integration tests for the quasi-normal mode (QNM) solver.
+"""Integration tests for quasi-normal mode (QNM) and one-sided leaky mode solving.
 
 QNMs satisfy outgoing-wave boundary conditions: instead of decaying evanescently
 away from the guiding region, the field radiates outward in both claddings.  Their
 effective indices are complex with Im(neff) < 0 (the mode decays in time as energy
 leaks out).
+
+With the unified API, QNMs are found by setting both claddings to
+``BoundaryCondition.Outgoing`` (either on the ``MultiLayer`` object or as
+per-call overrides to ``complex_neff`` / ``all_complex_neff``).
 
 Physical test structure
 -----------------------
@@ -32,8 +36,8 @@ OMEGA = 2 * math.pi / 1.55  # k0 at λ = 1.55 µm  (rad/µm)
 
 
 def make_leaky_slab(gap_t: float) -> rs.MultiLayer:
-    """Asymmetric slab with a tunable air-gap between core and substrate."""
-    return rs.MultiLayer(
+    """Asymmetric slab with both claddings set to Outgoing (QNM boundary conditions)."""
+    ml = rs.MultiLayer(
         [
             rs.Layer(1.0, 1.0),  # air cladding (left)
             rs.Layer(2.0, 0.6),  # waveguide core
@@ -41,6 +45,9 @@ def make_leaky_slab(gap_t: float) -> rs.MultiLayer:
             rs.Layer(2.2, 1.0),  # substrate (right)
         ]
     )
+    ml.set_left_boundary(rs.BoundaryCondition.Outgoing)
+    ml.set_right_boundary(rs.BoundaryCondition.Outgoing)
+    return ml
 
 
 @pytest.fixture
@@ -71,14 +78,14 @@ def symmetric_slab():
 
 
 def test_qnm_neff_returns_tuple_or_none(leaky_slab_thin):
-    """qnm_neff must return a 2-tuple or None, never raise."""
-    result = leaky_slab_thin.qnm_neff(OMEGA)
+    """complex_neff with Outgoing BCs must return a 2-tuple or None, never raise."""
+    result = leaky_slab_thin.complex_neff(OMEGA)
     assert result is None or (isinstance(result, tuple) and len(result) == 2)
 
 
 def test_all_qnm_neff_returns_list(leaky_slab_thin):
-    """all_qnm_neff must return a list (possibly empty) of 2-tuples."""
-    modes = leaky_slab_thin.all_qnm_neff(OMEGA)
+    """all_complex_neff with Outgoing BCs must return a list (possibly empty) of 2-tuples."""
+    modes = leaky_slab_thin.all_complex_neff(OMEGA)
     assert isinstance(modes, list)
     for item in modes:
         assert isinstance(item, tuple) and len(item) == 2
@@ -86,14 +93,14 @@ def test_all_qnm_neff_returns_list(leaky_slab_thin):
 
 def test_qnm_neff_no_mode_out_of_range(leaky_slab_thin):
     """Requesting a mode index far beyond the found count should return None."""
-    result = leaky_slab_thin.qnm_neff(OMEGA, mode=999)
+    result = leaky_slab_thin.complex_neff(OMEGA, mode=999)
     assert result is None
 
 
 def test_qnm_neff_empty_search_box(leaky_slab_thin):
     """A search rectangle that contains no QNM poles should return None."""
     # Real part 0.1–0.3 is well below all material indices — no modes there.
-    result = leaky_slab_thin.qnm_neff(
+    result = leaky_slab_thin.complex_neff(
         OMEGA,
         re_range=(0.1, 0.3),
         im_range=(-0.5, -1e-3),
@@ -110,7 +117,7 @@ def test_qnm_im_negative_thin_gap(leaky_slab_thin):
     # Use im_range=(-0.15, -1e-3): empirically reliable for this mode location
     # and avoids S-matrix anti-resonance instabilities that appear for deeper
     # or narrower search rectangles.
-    modes = leaky_slab_thin.all_qnm_neff(
+    modes = leaky_slab_thin.all_complex_neff(
         OMEGA,
         im_range=(-0.15, -1e-3),
     )
@@ -122,7 +129,7 @@ def test_qnm_im_negative_thin_gap(leaky_slab_thin):
 def test_qnm_im_negative_for_both_polarizations(leaky_slab_thin):
     """Im(neff) < 0 must hold for TE and TM QNMs alike."""
     for pol in (rs.Polarization.TE, rs.Polarization.TM):
-        modes = leaky_slab_thin.all_qnm_neff(
+        modes = leaky_slab_thin.all_complex_neff(
             OMEGA, polarization=pol, im_range=(-0.15, -1e-3)
         )
         for re, im in modes:
@@ -131,7 +138,12 @@ def test_qnm_im_negative_for_both_polarizations(leaky_slab_thin):
 
 def test_all_qnm_neff_symmetric_slab_all_negative_im(symmetric_slab):
     """Even for a symmetric slab, any found QNM must have Im(neff) ≤ 0."""
-    modes = symmetric_slab.all_qnm_neff(OMEGA, im_range=(-0.5, -1e-3))
+    modes = symmetric_slab.all_complex_neff(
+        OMEGA,
+        im_range=(-0.5, -1e-3),
+        left_bc=rs.BoundaryCondition.Outgoing,
+        right_bc=rs.BoundaryCondition.Outgoing,
+    )
     for re, im in modes:
         assert im <= 0.0, f"QNM Im(neff) must be ≤ 0 for symmetric slab, got {im:.6e}"
 
@@ -141,7 +153,7 @@ def test_all_qnm_neff_symmetric_slab_all_negative_im(symmetric_slab):
 
 def test_qnm_re_neff_in_physical_range(leaky_slab_thin):
     """Re(neff) should lie between the lowest and highest material index."""
-    result = leaky_slab_thin.qnm_neff(OMEGA, im_range=(-0.15, -1e-3))
+    result = leaky_slab_thin.complex_neff(OMEGA, im_range=(-0.15, -1e-3))
     if result is None:
         pytest.skip("No QNM found — skipping range check")
     re, im = result
@@ -167,7 +179,7 @@ def test_qnm_leakage_increases_as_gap_shrinks():
 
     for t in gaps:
         ml = make_leaky_slab(t)
-        result = ml.qnm_neff(OMEGA, im_range=(-0.15, -1e-3))
+        result = ml.complex_neff(OMEGA, im_range=(-0.15, -1e-3))
         if result is not None:
             re, im = result
             assert im < 0.0, f"Im(neff) must be < 0 for gap t={t}, got {im:.6e}"
@@ -212,7 +224,7 @@ def test_qnm_re_neff_tracks_guided_mode():
     if neff_guided is None:
         pytest.skip("No guided mode found for isolated core — skipping")
 
-    result = ml.qnm_neff(OMEGA, im_range=(-0.15, -1e-3))
+    result = ml.complex_neff(OMEGA, im_range=(-0.15, -1e-3))
     if result is None:
         pytest.skip("No QNM found — skipping consistency check")
 
@@ -228,8 +240,8 @@ def test_qnm_re_neff_tracks_guided_mode():
 
 
 def test_all_qnm_sorted_by_descending_re(leaky_slab_thin):
-    """all_qnm_neff must return modes sorted by descending Re(neff)."""
-    modes = leaky_slab_thin.all_qnm_neff(OMEGA, im_range=(-0.15, -1e-3))
+    """all_complex_neff must return QNMs sorted by descending Re(neff)."""
+    modes = leaky_slab_thin.all_complex_neff(OMEGA, im_range=(-0.15, -1e-3))
     if len(modes) < 2:
         pytest.skip("Need at least 2 QNMs to test ordering")
     re_vals = [re for re, _ in modes]
@@ -239,9 +251,9 @@ def test_all_qnm_sorted_by_descending_re(leaky_slab_thin):
 
 
 def test_qnm_neff_mode_0_matches_all_qnm_neff_first(leaky_slab_thin):
-    """qnm_neff(mode=0) should return the same result as all_qnm_neff[0]."""
-    all_modes = leaky_slab_thin.all_qnm_neff(OMEGA, im_range=(-0.15, -1e-3))
-    single = leaky_slab_thin.qnm_neff(OMEGA, mode=0, im_range=(-0.15, -1e-3))
+    """complex_neff(mode=0) should return the same result as all_complex_neff[0]."""
+    all_modes = leaky_slab_thin.all_complex_neff(OMEGA, im_range=(-0.15, -1e-3))
+    single = leaky_slab_thin.complex_neff(OMEGA, mode=0, im_range=(-0.15, -1e-3))
     if not all_modes:
         assert single is None
     else:

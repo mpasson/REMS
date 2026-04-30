@@ -41,6 +41,7 @@ test/
   test_slab.py          — pytest: single slab, coupled slab, asymmetric coupled slab
   test_field.py         — pytest: MaxField/Power normalization, field_complex on lossy slab
   test_pec.py           — pytest: PEC boundary condition tests
+  test_qnm.py           — pytest: QNM and leaky-mode tests (use complex_neff with Outgoing BCs)
 
 remsol.pyi              — Python type stubs (must stay in sync with lib.rs pymodule)
 pyproject.toml          — Maturin + uv configuration
@@ -142,6 +143,10 @@ uv run maturin develop --uv --release
   field decays evanescently outward.
 - **PEC** (Perfect Electric Conductor): the tangential electric field is forced to zero
   at the boundary wall. Can be applied to the left or right side (not both).
+- **Outgoing**: the field propagates outward (outgoing-wave / radiating condition) rather
+  than decaying evanescently. Used with the complex-plane solver to find QNMs or leaky
+  modes. Set via `set_left_boundary` / `set_right_boundary`, or passed as a per-call
+  override to `complex_neff` / `all_complex_neff`.
 
 ### Backends
 - **Transfer Matrix Method (TMM)** — `BackEnd::Transfer` — supports both `neff()` and
@@ -188,11 +193,26 @@ Returns real `float` values.
 Finds modes in a rectangle of the complex `neff` plane using a three-stage algorithm.
 Returns complex `(Re(neff), Im(neff))` tuples. Handles:
 - **Lossy guided modes**: `Im(n) ≠ 0` in one or more layers → `Im(neff) ≠ 0`.
-- **Leaky modes**: `Re(neff) < Re(n_clad)` → field radiates into the cladding.
+- **Quasi-normal modes (QNMs)**: both claddings `Outgoing` → `Im(neff) < 0` (temporal
+  decay at fixed real k∥).
+- **One-sided leaky modes**: left `SemiInfinite` + right `Outgoing` → `Im(neff) > 0`
+  (spatial decay along the guide at real ω).
 
-**Default search rectangle:**
-- `re_range = (Re(n_min), Re(n_max))` — same bounds as the real-axis solver.
-- `im_range = (-w, +w)` where `w = max(max_j |Im(n_j)|, 1e-3)`.
+The boundary conditions used to build the S-matrix are taken from the `MultiLayer`
+object's stored `left_bc` / `right_bc` (set via `set_left_boundary` /
+`set_right_boundary`), and can be overridden for a single call with the optional
+`left_bc` / `right_bc` keyword arguments.
+
+| `left_bc`    | `right_bc`   | Mode type                              |
+|--------------|--------------|----------------------------------------|
+| SemiInfinite | SemiInfinite | Guided / lossy guided (`Im ≈ 0`)       |
+| Outgoing     | Outgoing     | Quasi-normal modes (`Im(neff) < 0`)    |
+| SemiInfinite | Outgoing     | One-sided leaky modes (`Im(neff) > 0`) |
+
+**Default `im_range`** adapts automatically to the active BCs:
+- Both `SemiInfinite` or `PEC`: near-real window (symmetric for lossy, asymmetric for lossless).
+- Both `Outgoing` (QNM): `(-0.15, -1e-3)` — lower half-plane.
+- One `Outgoing` (leaky): `(1e-3, 0.15)` — upper half-plane.
 
 **Algorithm:**
 
@@ -212,7 +232,7 @@ Returns complex `(Re(neff), Im(neff))` tuples. Handles:
    No derivative required.
 
 **Practical guidance for the search rectangle:**
-- For lossless structures, use a square imaginary window (e.g. `im_range=(-0.05, 0.05)`)
+- For lossless guided modes, use a square imaginary window (e.g. `im_range=(-0.05, 0.05)`)
   rather than a very thin one. A thin window (e.g. `±1e-4`) produces an extremely
   elongated rectangle where the top/bottom contour sides pass very close to the real-axis
   poles, making the winding number unreliable. Use one moderately-sized square box per
@@ -221,49 +241,26 @@ Returns complex `(Re(neff), Im(neff))` tuples. Handles:
   `re_range=(0.0, n_max)`.
 - For lossy structures, `im_range` is set automatically from the material loss.
 
-### 3. QNM solver — `qnm_neff` / `all_qnm_neff`
+**QNM example (both claddings Outgoing):**
+```python
+ml.set_left_boundary(BoundaryCondition.Outgoing)
+ml.set_right_boundary(BoundaryCondition.Outgoing)
+re, im = ml.complex_neff(omega)   # im < 0
 
-Finds quasi-normal modes (QNMs) using **outgoing-wave** boundary conditions on **both**
-semi-infinite claddings (`kz_outgoing` on left and right). QNM poles live in the
-**lower** half of the complex `neff` plane (`Im(neff) < 0`): they parametrise temporal
-decay at fixed real k∥ (complex-ω picture).
+# Or as a per-call override (doesn't change stored BCs):
+re, im = ml.complex_neff(omega,
+    left_bc=BoundaryCondition.Outgoing,
+    right_bc=BoundaryCondition.Outgoing,
+    im_range=(-0.15, -1e-3))
+```
 
-Uses the same winding-number / Muller-polisher pipeline as the complex-plane solver but
-evaluates `calculate_s_matrix_qnm` instead of `calculate_s_matrix`.
+**One-sided leaky mode example (left SemiInfinite, right Outgoing):**
+```python
+ml.set_right_boundary(BoundaryCondition.Outgoing)
+re, im = ml.complex_neff(omega)   # im > 0
+```
 
-**When to use:** strictly symmetric QNM problems where both claddings have the same
-(low) index and the mode radiates into both sides equally.
-
-**Default search rectangle:**
-- `re_range = (Re(n_min) + ε, Re(n_max) − ε)`.
-- `im_range = (-0.15, -1e-3)` — entirely below the real axis.
-
-### 4. One-sided leaky mode solver — `leaky_neff` / `all_leaky_neff`
-
-Finds one-sided leaky modes using **evanescent** (physical) boundary conditions on the
-left cladding (`kz_physical`) and **outgoing-wave** conditions on the right cladding
-(`kz_outgoing`). Evaluates `calculate_s_matrix_leaky_right`.
-
-Use this when the mode is evanescently confined on the low-index left side but radiates
-into a higher-index substrate on the right (e.g. an asymmetric slab where
-`n_substrate > n_core`). Poles live in the **upper** half of the complex `neff` plane
-(`Im(neff) > 0`): with real ω and complex k∥ = neff·k₀, `Im(neff) > 0` means the
-field decays spatially along the waveguide (complex-k picture).
-
-**Sign convention — leaky_neff vs qnm_neff:**
-
-| Solver | k∥ | ω | Im(neff) sign | Meaning |
-|--------|----|---|---------------|---------|
-| `qnm_neff` | real | complex | < 0 | temporal decay |
-| `leaky_neff` | complex | real | > 0 | spatial decay along guide |
-
-**Expected behaviour (core over substrate, n_substrate > n_core):**
-- `Re(neff)` ≈ isolated-core guided-mode value (converges as gap → ∞).
-- `Re(neff)` **increases** as the gap shrinks (more high-n substrate overlap).
-- `Im(neff)` grows as `∝ exp(−2γt)` where `γ = k₀·sqrt(Re(neff)² − n_gap²)` is the
-  evanescent decay constant in the gap layer.
-
-**Search strategy and winding-number sensitivity:**
+**Search strategy for weakly leaky modes** (winding-number sensitivity):
 
 The winding-number contour requires `im_max` to be roughly **40× larger** than the
 actual `Im(neff)` value for reliable pole counting. When multiple modes with very
@@ -271,25 +268,23 @@ different Im values are present in the same rectangle the count can be wrong. Us
 **restricted `re_range`** to isolate the mode of interest:
 
 ```python
-# Stage 1 — broad re_range, cascade of three im windows (positive, upper half-plane)
-STAGE1_RE = (1.7, 2.0)   # excludes TE1 at Re≈1.19
+# Stage 1 — broad re_range, cascade of three im windows (upper half-plane)
+STAGE1_RE = (1.7, 2.0)
 for win in [(1e-3, 0.15), (1e-5, 0.01), (1e-8, 1e-3)]:
-    r = ml.leaky_neff(omega, im_range=win, re_range=STAGE1_RE)
+    r = ml.complex_neff(omega, im_range=win, re_range=STAGE1_RE)
     if r and r[1] > 0:
         break
 
-# Stage 2 — very tight re_range, wide im window (catches weakly leaky modes)
+# Stage 2 — very tight re_range, wide im window (weakly leaky)
 if r is None:
-    r = ml.leaky_neff(omega, re_range=(1.75, 1.85), im_range=(1e-8, 0.01))
+    r = ml.complex_neff(omega, re_range=(1.75, 1.85), im_range=(1e-8, 0.01))
 
 # Stage 3 — real-axis fallback when Im < ~1e-11 (large gap)
 if r is None:
     guided = ml.all_neff(omega)
 ```
 
-**Default search rectangle:**
-- `re_range = (Re(n_min) + ε, Re(n_max) − ε)`.
-- `im_range = (1e-3, 0.15)` — entirely above the real axis (mirror of QNM default).
+For very weakly leaky modes (`Im < ~1e-11`, large gap), use the real-axis solver instead.
 
 ---
 
@@ -301,7 +296,7 @@ Exposed classes (registered in `lib.rs` pymodule, typed in `remsol.pyi`):
 |-----------------|-----------------|---------------------------------------------------|
 | `Polarization`  | `Polarization`  | Enum: `.TE`, `.TM`                                |
 | `BackEnd`       | `BackEnd`       | Enum: `.Transfer`, `.Scattering`                  |
-| `BoundaryCondition` | `BoundaryCondition` | Enum: `.SemiInfinite`, `.PEC`           |
+| `BoundaryCondition` | `BoundaryCondition` | Enum: `.SemiInfinite`, `.PEC`, `.Outgoing` |
 | `Normalization` | `Normalization` | Enum: `.MaxField` (default), `.Power`             |
 | `Layer`         | `Layer`         | `Layer(n: float | complex, d: float)`             |
 | `PEC`           | `PEC`           | Boundary marker; place first or last in layer list|
@@ -315,17 +310,13 @@ Key `MultiLayer` methods:
 |--------|---------|-------|
 | `neff(omega, polarization, mode)` | `float \| None` | Real-axis solver |
 | `all_neff(omega, polarization)` | `list[float]` | Real-axis solver |
-| `complex_neff(omega, polarization, mode, re_range, im_range)` | `tuple[float,float] \| None` | Complex-plane solver |
-| `all_complex_neff(omega, polarization, re_range, im_range)` | `list[tuple[float,float]]` | Complex-plane solver |
+| `complex_neff(omega, polarization, mode, re_range, im_range, left_bc, right_bc)` | `tuple[float,float] \| None` | Complex-plane solver; BCs control mode type |
+| `all_complex_neff(omega, polarization, re_range, im_range, left_bc, right_bc)` | `list[tuple[float,float]]` | Complex-plane solver; all modes in rectangle |
 | `field(omega, polarization, mode)` | `FieldData` | TMM only; real neff from real-axis solver |
-| `field_complex(omega, polarization, neff_re, neff_im)` | `FieldData` | TMM; accepts explicit complex neff |
-| `qnm_neff(omega, polarization, mode, re_range, im_range)` | `tuple[float,float] \| None` | QNM solver; `Im(neff) < 0`; both claddings outgoing |
-| `all_qnm_neff(omega, polarization, re_range, im_range)` | `list[tuple[float,float]]` | QNM solver; all modes in search rectangle |
-| `leaky_neff(omega, polarization, mode, re_range, im_range)` | `tuple[float,float] \| None` | One-sided leaky solver; `Im(neff) > 0`; left evanescent, right outgoing |
-| `all_leaky_neff(omega, polarization, re_range, im_range)` | `list[tuple[float,float]]` | One-sided leaky solver; all modes in search rectangle |
+| `complex_field(omega, polarization, mode, re_range, im_range, left_bc, right_bc)` | `FieldData` | TMM; finds neff via complex solver then reconstructs field |
 | `index()` | `IndexData` | Real part of n |
-| `set_left_boundary(bc)` | `None` | Alternative to PEC marker |
-| `set_right_boundary(bc)` | `None` | Alternative to PEC marker |
+| `set_left_boundary(bc)` | `None` | Set left BC: `SemiInfinite`, `PEC`, or `Outgoing` |
+| `set_right_boundary(bc)` | `None` | Set right BC: `SemiInfinite`, `PEC`, or `Outgoing` |
 | `set_normalization(norm)` | `None` | Switch field normalization convention |
 
 ---
@@ -494,22 +485,18 @@ git push && git push --tags
 ## Known Limitations and Out-of-Scope Items
 
 - Only **1D planar** structures; no 2D or 3D geometries.
-- The **SMM backend does not support field calculation** (`field()` and `field_complex()`
+- The **SMM backend does not support field calculation** (`field()` and `complex_field()`
   always use the TMM backend regardless of `MultiLayer.backend`).
-- The **complex-plane solver does not support PEC boundary conditions** — it always uses
-  the SMM with semi-infinite boundary conditions.
-- `field_complex()` does not support PEC boundary conditions for the same reason: the
+- The **complex-plane solver does not support PEC boundary conditions** — when `left_bc`
+  or `right_bc` is `PEC`, the S-matrix treats it as `SemiInfinite`. PEC is only
+  meaningful for the real-axis TMM solver.
+- `complex_field()` does not support PEC boundary conditions for the same reason: the
   complex neff search (which provides the input neff) requires semi-infinite boundaries.
-- The **QNM solver** (`qnm_neff` / `all_qnm_neff`) does not support PEC boundary
-  conditions — it always uses semi-infinite outgoing-wave conditions on both claddings.
-- The **one-sided leaky solver** (`leaky_neff` / `all_leaky_neff`) does not support PEC
-  boundary conditions — it always uses semi-infinite conditions (evanescent left,
-  outgoing right).
-- `leaky_neff` finds poles in the **upper** half-plane (`Im(neff) > 0`, spatial decay
-  along the waveguide at real ω). The winding-number algorithm requires `im_max` to be
-  roughly 40× larger than the actual `Im(neff)` for reliable counting; use a restricted
-  `re_range` to isolate individual modes when multiple resonances are present. For very
-  weakly leaky modes (`Im < ~1e-11`, large gap), use the real-axis solver instead.
+- When using `Outgoing` boundary conditions with `complex_neff`, the winding-number
+  algorithm requires `im_max` to be roughly 40× larger than the actual `Im(neff)` for
+  reliable counting; use a restricted `re_range` to isolate individual modes when
+  multiple resonances are present. For very weakly leaky modes (`Im < ~1e-11`, large
+  gap), use the real-axis solver instead.
 - The `index()` method returns only `Re(n)` for plotting; imaginary parts of the index
   profile are not currently visualised.
 - **Power normalization** (`Normalization.Power`) is only physically meaningful for
