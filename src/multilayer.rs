@@ -528,8 +528,6 @@ impl MultiLayer {
         let mode = mode.unwrap_or(0);
         let eff_left = left_bc.unwrap_or(self.left_bc);
         let eff_right = right_bc.unwrap_or(self.right_bc);
-        let (re_range, im_range) =
-            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
         let roots =
             self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right);
         roots.get(mode).map(|c| (c.re, c.im))
@@ -564,8 +562,6 @@ impl MultiLayer {
         let polarization = polarization.unwrap_or(Polarization::TE);
         let eff_left = left_bc.unwrap_or(self.left_bc);
         let eff_right = right_bc.unwrap_or(self.right_bc);
-        let (re_range, im_range) =
-            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
         self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right)
             .into_iter()
             .map(|c| (c.re, c.im))
@@ -616,8 +612,6 @@ impl MultiLayer {
         let mode = mode.unwrap_or(0);
         let eff_left = left_bc.unwrap_or(self.left_bc);
         let eff_right = right_bc.unwrap_or(self.right_bc);
-        let (re_range, im_range) =
-            self.default_search_ranges_for_bc(re_range, im_range, eff_left, eff_right);
         let roots =
             self.solve_complex(omega, polarization, re_range, im_range, eff_left, eff_right);
         match roots.get(mode) {
@@ -843,20 +837,33 @@ impl MultiLayer {
 
     // ── Complex-plane mode search ─────────────────────────────────────────────
 
-    /// Returns the default search rectangle for the complex-plane solver,
-    /// adapting the `im_range` to the active boundary conditions.
+    /// Resolves the user-supplied search ranges against the defaults for the
+    /// active boundary conditions.
     ///
-    /// * Both `SemiInfinite` or `PEC`: near-real window (symmetric for lossy,
-    ///   slightly asymmetric for lossless structures).
-    /// * Both `Outgoing` (QNM): `(-QNM_IM_DEFAULT_DEPTH, QNM_IM_DEFAULT_MAX)`.
-    /// * One `Outgoing` (one-sided leaky): `(MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH)`.
+    /// Returns `None` when the caller passed `None` for **both** `re_range` and
+    /// `im_range`, signalling that [`solve_complex`] should use the adaptive
+    /// multi-rectangle search ([`adaptive_solve_complex`]) instead of a single
+    /// fixed rectangle. When either range is supplied explicitly, the legacy
+    /// single-rectangle behaviour is preserved: the supplied range is used as-is
+    /// and the missing one is filled in from the BC-dependent defaults below.
+    ///
+    /// Default `im_range` by boundary-condition combination:
+    /// - `SemiInfinite` + `SemiInfinite` → near-real window (symmetric for lossy,
+    ///   slightly asymmetric for lossless).
+    /// - `Outgoing` + `Outgoing` → lower half-plane `(-0.15, -1e-3)` for QNMs.
+    /// - One `Outgoing` → upper half-plane `(1e-3, 0.15)` for leaky modes.
     fn default_search_ranges_for_bc(
         &self,
         re_range: Option<(f64, f64)>,
         im_range: Option<(f64, f64)>,
         left_bc: BoundaryCondition,
         right_bc: BoundaryCondition,
-    ) -> ((f64, f64), (f64, f64)) {
+    ) -> Option<((f64, f64), (f64, f64))> {
+        // Both ranges unset → adaptive path takes over.
+        if re_range.is_none() && im_range.is_none() {
+            return None;
+        }
+
         let re = re_range.unwrap_or_else(|| {
             let (min_n, max_n) = self.find_minmax_n();
             let margin = 1e-6;
@@ -883,7 +890,7 @@ impl MultiLayer {
                 }
             }
         });
-        (re, im)
+        Some((re, im))
     }
 
     /// Computes the winding number of `f` around a rectangle in the complex plane.
@@ -1225,26 +1232,298 @@ impl MultiLayer {
         }
     }
 
+    /// Builds the decade cascade of `im` windows used by the adaptive solver.
+    ///
+    /// Each window has a 10:1 ratio of `im_max` to `im_min`, giving a
+    /// well-conditioned aspect ratio for typical `re_range` widths of order 1.
+    /// The sign of both bounds follows `sign`: negative for QNM (lower
+    /// half-plane), positive for leaky (upper half-plane).
+    ///
+    /// The cascade covers four decades from `1e-1` down to `1e-9`, which is the
+    /// practical floor of the winding-number method. Modes with smaller `|Im|`
+    /// are caught by the real-axis fallback in [`adaptive_solve_complex`].
+    fn im_cascade(sign: f64) -> Vec<(f64, f64)> {
+        // (im_min, im_max) in absolute value; sign applied below.
+        const DECADES: [(f64, f64); 4] = [(1e-3, 1e-1), (1e-5, 1e-2), (1e-7, 1e-3), (1e-9, 1e-4)];
+        DECADES
+            .iter()
+            .map(|&(lo, hi)| {
+                // For sign = -1 (QNM, lower half-plane) the bounds are negative
+                // and must be ordered im_min < im_max, i.e. the more-negative
+                // value comes first.
+                let (a, b) = (sign * lo, sign * hi);
+                if a <= b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect()
+    }
+
+    /// Builds narrow overlapping `re` windows around each real-axis probe result.
+    ///
+    /// Each probe at `r_i` produces a window `(r_i - δ, r_i + δ)` with
+    /// `δ = ADAPTIVE_RE_HALF_WIDTH`. Isolating each pole in its own narrow `re`
+    /// window is the single biggest reliability win for the winding-number
+    /// method: it ensures the contour sees one mode at a time and allows the
+    /// `im` cascade to push `im_max` well above the actual `Im(neff)` without
+    /// straying into a neighbouring pole's territory.
+    fn narrow_re_windows(probes: &[f64]) -> Vec<(f64, f64)> {
+        const ADAPTIVE_RE_HALF_WIDTH: f64 = 0.05;
+        probes
+            .iter()
+            .map(|&r| (r - ADAPTIVE_RE_HALF_WIDTH, r + ADAPTIVE_RE_HALF_WIDTH))
+            .collect()
+    }
+
+    /// Removes duplicate roots that are closer than `1e-8 * k0` in the complex
+    /// plane, or that both lie on the real axis within `1e-10` of each other
+    /// (the real-axis-fallback vs. complex-solver case).
+    fn dedup_roots(roots: Vec<Complex<f64>>, k0: f64) -> Vec<Complex<f64>> {
+        let mut kept: Vec<Complex<f64>> = Vec::with_capacity(roots.len());
+        for r in roots {
+            let is_dup = kept.iter().any(|&k| {
+                let both_real = r.im.abs() < 1e-10 && k.im.abs() < 1e-10;
+                if both_real {
+                    (r.re - k.re).abs() < 1e-10
+                } else {
+                    (r - k).norm() < 1e-8 * k0
+                }
+            });
+            if !is_dup {
+                kept.push(r);
+            }
+        }
+        kept
+    }
+
+    /// Builds an isolated-core probe for the real-axis solver.
+    ///
+    /// Constructs a 3-layer stack: lowest-index cladding | core layers |
+    /// lowest-index cladding, where the "core layers" are all interior layers
+    /// of the original stack (i.e. `self.layers[1..n-1]`). Runs the real-axis
+    /// solver on this simplified stack to find guided-mode Re(neff) candidates.
+    ///
+    /// This is used by [`adaptive_solve_complex`] when the full stack has no
+    /// guided mode (e.g. `n_substrate > n_core`): the leaky mode's Re(neff) is
+    /// typically close to the isolated-core guided mode's Re(neff), so the
+    /// probe seeds narrow `re` windows for the complex cascade.
+    fn isolated_core_probe(&self, k0: f64, polarization: Polarization) -> Vec<f64> {
+        if self.layers.len() < 3 {
+            return Vec::new();
+        }
+        // Find the lowest real index among all layers (use Re(n)).
+        let min_n_re = self
+            .layers
+            .iter()
+            .map(|l| l.n.re)
+            .fold(f64::INFINITY, f64::min);
+        // Build the isolated core: cladding | interior layers | cladding.
+        let mut iso_layers = Vec::with_capacity(self.layers.len() + 1);
+        iso_layers.push(Layer::from_real(min_n_re, 1.0));
+        for layer in &self.layers[1..self.layers.len() - 1] {
+            iso_layers.push(layer.clone());
+        }
+        iso_layers.push(Layer::from_real(min_n_re, 1.0));
+        let iso_ml = MultiLayer::new(iso_layers);
+        iso_ml.solve(k0, polarization)
+    }
+
+    /// Adaptive multi-rectangle complex-mode search.
+    ///
+    /// Replaces the single fixed rectangle of the legacy path with a four-stage
+    /// search that needs no user-supplied `re_range` / `im_range` for reasonable
+    /// structures:
+    ///
+    /// - **Stage A — real-axis probe.** Runs the fast real-axis solver [`solve`]
+    ///   to find guided-mode candidates. For lossless + both-`SemiInfinite`
+    ///   structures these *are* the modes (returned with `Im = 0`). Otherwise
+    ///   the probe seeds narrow `re` windows (via [`narrow_re_windows`]) for the
+    ///   complex cascade and provides the real-axis fallback.
+    /// - **Stage B — coarse complex rectangle.** One broad-`Im` rectangle (the
+    ///   old default) to catch strongly leaky / strongly lossy modes.
+    /// - **Stage C — `Im` decade cascade.** Four geometrically well-conditioned
+    ///   windows (see [`im_cascade`]) covering `|Im|` from `1e-1` down to `1e-9`.
+    /// - **Stage D — real-axis fallback.** If the cascade found no complex root
+    ///   but the probe did, emit the real-axis mode with `Im = 0`. Disabled for
+    ///   QNM BCs (both `Outgoing`), where a real root is unphysical.
+    ///
+    /// Roots from all stages are deduplicated via [`dedup_roots`] and sorted by
+    /// descending `Re(neff)`.
+    fn adaptive_solve_complex(
+        &self,
+        k0: f64,
+        polarization: Polarization,
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
+    ) -> Vec<Complex<f64>> {
+        let char_fn = |k: Complex<f64>| {
+            self.characteristic_function_with_bc(k0, k, polarization, left_bc, right_bc)
+        };
+
+        let both_outgoing = matches!(left_bc, BoundaryCondition::Outgoing)
+            && matches!(right_bc, BoundaryCondition::Outgoing);
+        let one_outgoing = matches!(left_bc, BoundaryCondition::Outgoing)
+            ^ matches!(right_bc, BoundaryCondition::Outgoing);
+        let all_lossless = self.layers.iter().all(|l| l.n.im == 0.0);
+        let both_physical = !both_outgoing && !one_outgoing;
+
+        // ── Stage A: real-axis probe ──────────────────────────────────────────
+        // The real-axis solver uses kz_physical (TMM sheet), which is the correct
+        // sheet for guided modes but not for QNMs. We still run it for QNM/leaky
+        // structures because a real-axis peak there signals a mode with
+        // |Im| < ~1e-11 (effectively guided), and its Re(neff) seeds the narrow
+        // re windows for the complex cascade.
+        //
+        // For leaky/QNM structures where the full stack has no guided mode
+        // (e.g. n_substrate > n_core), we also probe the *isolated core* — the
+        // stack with both claddings replaced by the lowest-index material — to
+        // get a Re(neff) hint for the leaky mode. The leaky mode's Re(neff) is
+        // typically close to the isolated-core guided mode's Re(neff).
+        //
+        // `full_probe` is used for the real-axis fallback (stage D);
+        // `re_hints` combines full_probe + isolated-core probe and is used only
+        // to seed narrow re windows for the complex cascade.
+        let full_probe: Vec<f64> = if all_lossless {
+            self.solve(k0, polarization)
+        } else {
+            Vec::new()
+        };
+        let mut re_hints = full_probe.clone();
+        if re_hints.is_empty() && all_lossless && (both_outgoing || one_outgoing) {
+            re_hints = self.isolated_core_probe(k0, polarization);
+        }
+        let real_probe = re_hints;
+
+        // Lossless guided structure: the probe is the answer.
+        if both_physical && all_lossless {
+            return real_probe.iter().map(|&n| Complex::new(n, 0.0)).collect();
+        }
+
+        // ── Determine the Im search strategy from the BCs ────────────────────
+        // Three cases:
+        //  - QNM (both Outgoing)            → lower half-plane only (sign = -1).
+        //  - One-sided leaky (one Outgoing) → upper half-plane only (sign = +1).
+        //  - Lossy guided (both physical, lossy material): the mode sits near
+        //    the real axis with Im(neff) < 0 (loss) but small. Use a symmetric
+        //    window around the real axis, sized from the material loss.
+        //
+        // (both_outgoing / one_outgoing / both_physical are computed above.)
+
+        // Build the list of (im_min, im_max) windows to search.
+        let mut im_windows: Vec<(f64, f64)> = Vec::new();
+        if both_outgoing {
+            // QNM: lower half-plane. Stage B (broad) + stage C (cascade).
+            // Bounds are negative; order them im_min < im_max.
+            im_windows.push((-QNM_IM_DEFAULT_DEPTH, -MIN_IM_LOWER));
+            im_windows.extend(Self::im_cascade(-1.0));
+        } else if one_outgoing {
+            // One-sided leaky: upper half-plane. Stage B (broad) + stage C.
+            im_windows.push((MIN_IM_LOWER, QNM_IM_DEFAULT_DEPTH));
+            im_windows.extend(Self::im_cascade(1.0));
+        } else {
+            // Lossy guided (both physical, lossy material). The mode sits near
+            // the real axis; Im(neff) < 0 with magnitude ~ material loss.
+            // Use a symmetric window sized from the max material loss, clamped
+            // to a minimum half-width so the contour is well-conditioned.
+            let max_loss = self
+                .layers
+                .iter()
+                .map(|l| l.n.im.abs())
+                .fold(0.0_f64, f64::max);
+            let half_w = max_loss.max(MIN_IM_HALF_WIDTH) * 2.0;
+            im_windows.push((-half_w, half_w));
+        }
+
+        // ── Build the list of re windows to search ────────────────────────────
+        // Build the list of re windows to search. We always include the broad
+        // index-range window as a fallback, plus narrow windows around any
+        // real-axis probe results. The narrow windows isolate individual poles
+        // (better winding-number conditioning); the broad window catches modes
+        // whose Re(neff) is shifted far from the probe (e.g. strongly leaky QNMs).
+        let (min_n, max_n) = self.find_minmax_n();
+        let broad_re = (min_n.max(0.0), max_n + 1e-6);
+        let mut re_windows: Vec<(f64, f64)> = Self::narrow_re_windows(&real_probe);
+        re_windows.push(broad_re);
+
+        let mut roots: Vec<Complex<f64>> = Vec::new();
+
+        // Run the im windows in order (broad first, then cascade). For each im
+        // window, sub-divide the re windows to keep the aspect ratio bounded.
+        // All im windows are run (no stop-early) to ensure the correct mode is
+        // found even when a spurious mode appears in a broader window. The
+        // cascade windows are cheap, so the full sweep is still fast.
+        const TARGET_ASPECT_RATIO: f64 = 10.0;
+
+        for &(im_min, im_max) in &im_windows {
+            let im_width = (im_max - im_min).abs();
+            if im_width < 1e-15 {
+                continue;
+            }
+            // Target re sub-window width: aspect_ratio * im_width, clamped to
+            // [0.05, 0.5] so we don't get absurdly tiny or huge windows.
+            let target_re_width = (TARGET_ASPECT_RATIO * im_width).clamp(0.05, 0.5);
+
+            for (re_lo, re_hi) in &re_windows {
+                let mut start = *re_lo;
+                while start < *re_hi {
+                    let end = (start + target_re_width).min(*re_hi);
+                    self.find_zeros_in_rectangle(
+                        k0, start, end, im_min, im_max, 0, &mut roots, &char_fn,
+                    );
+                    // If we've reached the end of the re window, stop.
+                    if end >= *re_hi {
+                        break;
+                    }
+                    // Overlap by 20% to avoid missing a mode on the seam.
+                    start = end - 0.2 * target_re_width;
+                }
+            }
+
+            // No stop-early: we run all im windows to ensure we find the
+            // correct mode. The cascade windows are cheap (a few hundred
+            // S-matrix evaluations each for the winding number) and stopping
+            // early risks missing the target mode when a spurious mode is found
+            // first in a broader window. The real-axis fallback (stage D) still
+            // runs after the loop.
+        }
+
+        // ── Stage D: real-axis fallback ───────────────────────────────────────
+        // If the cascade found nothing and the full-structure probe found a
+        // real-axis mode, the mode is effectively guided (|Im| < 1e-9). Emit it
+        // with Im = 0 — unless we are under QNM BCs, where a real root is
+        // unphysical. We use `full_probe` (not the isolated-core hints) so we
+        // don't emit a spurious real mode from a different structure.
+        if !both_outgoing {
+            for &n_re in &full_probe {
+                // Only emit fallback for probes that lie inside one of the re
+                // windows we searched (otherwise we'd resurrect out-of-range
+                // guided modes that the user did not ask for).
+                let in_window = re_windows.iter().any(|(lo, hi)| n_re >= *lo && n_re <= *hi);
+                if in_window {
+                    roots.push(Complex::new(n_re * k0, 0.0));
+                }
+            }
+        }
+
+        // ── Deduplicate and sort ─────────────────────────────────────────────
+        let roots = Self::dedup_roots(roots, k0);
+        let mut neff_roots: Vec<Complex<f64>> = roots.iter().map(|&k| k / k0).collect();
+        neff_roots.sort_by(|a, b| b.re.partial_cmp(&a.re).unwrap_or(Ordering::Equal));
+        neff_roots
+    }
+
     /// Finds all complex effective indices in the given search rectangle.
     ///
     /// Uses the argument-principle winding-number method to count and bracket
     /// zeros, then polishes each one with Muller's method.
     ///
-    /// For **lossless** structures the characteristic function `1/det(S)` has
-    /// branch cuts in the upper half-plane (arising from the `kz_physical` sign
-    /// convention), which can corrupt the winding-number integral when the
-    /// search rectangle spans both half-planes.  To mitigate this, the complex
-    /// solver is supplemented by the real-axis solver (`solve`): any real-axis
-    /// mode whose `Re(neff)` falls within `re_range` is added to the result set
-    /// with `Im(neff) = 0`.  This ensures that purely guided modes (which sit
-    /// exactly on the real axis) are never missed, while the complex solver
-    /// continues to handle genuinely complex modes (lossy or quasi-guided).
-    ///
-    /// # Arguments
-    /// * `k0`           - Vacuum wavevector (real).
-    /// * `polarization` - Polarisation.
-    /// * `re_range`     - `(re_min, re_max)` for `Re(neff)`.
-    /// * `im_range`     - `(im_min, im_max)` for `Im(neff)`.
+    /// When called with `Some((re_range, im_range))` the legacy single-rectangle
+    /// behaviour is used (plus the real-axis supplement for lossless + physical
+    /// BCs). When called with `None` the adaptive multi-rectangle search
+    /// ([`adaptive_solve_complex`]) takes over, requiring no user-supplied
+    /// ranges.
     ///
     /// # Returns
     /// Complex effective indices sorted by descending `Re(neff)`.
@@ -1252,11 +1531,19 @@ impl MultiLayer {
         &self,
         k0: f64,
         polarization: Polarization,
-        re_range: (f64, f64),
-        im_range: (f64, f64),
+        re_range: Option<(f64, f64)>,
+        im_range: Option<(f64, f64)>,
         left_bc: BoundaryCondition,
         right_bc: BoundaryCondition,
     ) -> Vec<Complex<f64>> {
+        // Adaptive path: no explicit ranges supplied.
+        let (re_range, im_range) =
+            match self.default_search_ranges_for_bc(re_range, im_range, left_bc, right_bc) {
+                Some(ranges) => ranges,
+                None => return self.adaptive_solve_complex(k0, polarization, left_bc, right_bc),
+            };
+
+        // Legacy path: single rectangle.
         let char_fn = |k: Complex<f64>| {
             self.characteristic_function_with_bc(k0, k, polarization, left_bc, right_bc)
         };
@@ -1289,13 +1576,16 @@ impl MultiLayer {
     }
 
     /// Returns the complex effective index of a single mode.
+    ///
+    /// When `re_range` / `im_range` are `None` the adaptive multi-rectangle
+    /// search is used; otherwise the legacy single-rectangle path is used.
     pub fn complex_neff(
         &self,
         k0: f64,
         polarization: Polarization,
         mode: usize,
-        re_range: (f64, f64),
-        im_range: (f64, f64),
+        re_range: Option<(f64, f64)>,
+        im_range: Option<(f64, f64)>,
         left_bc: BoundaryCondition,
         right_bc: BoundaryCondition,
     ) -> Result<Complex<f64>, String> {
@@ -1901,8 +2191,8 @@ mod tests {
         let roots = slab.solve_complex(
             om,
             Polarization::TE,
-            (1.0, 2.0),
-            (-0.05, 0.05),
+            Some((1.0, 2.0)),
+            Some((-0.05, 0.05)),
             BoundaryCondition::SemiInfinite,
             BoundaryCondition::SemiInfinite,
         );
@@ -2213,8 +2503,8 @@ mod tests {
             let complex_modes = slab.solve_complex(
                 om,
                 Polarization::TE,
-                (re_mode - 0.05, re_mode + 0.05),
-                (-0.05, 0.05),
+                Some((re_mode - 0.05, re_mode + 0.05)),
+                Some((-0.05, 0.05)),
                 BoundaryCondition::SemiInfinite,
                 BoundaryCondition::SemiInfinite,
             );
@@ -2258,8 +2548,8 @@ mod tests {
             let complex_modes = slab.solve_complex(
                 om,
                 Polarization::TE,
-                (re_mode - 0.05, re_mode + 0.05),
-                (-0.05, 0.05),
+                Some((re_mode - 0.05, re_mode + 0.05)),
+                Some((-0.05, 0.05)),
                 BoundaryCondition::SemiInfinite,
                 BoundaryCondition::SemiInfinite,
             );
@@ -2298,8 +2588,8 @@ mod tests {
         let complex_modes = slab_lossy.solve_complex(
             om,
             Polarization::TE,
-            (1.0, 2.0),
-            (-0.05, 0.05),
+            Some((1.0, 2.0)),
+            Some((-0.05, 0.05)),
             BoundaryCondition::SemiInfinite,
             BoundaryCondition::SemiInfinite,
         );
@@ -2452,8 +2742,8 @@ mod tests {
         let modes = slab.solve_complex(
             om,
             Polarization::TE,
-            (1.0 + 1e-6, 2.2 - 1e-6),
-            (-0.15, -1e-3),
+            Some((1.0 + 1e-6, 2.2 - 1e-6)),
+            Some((-0.15, -1e-3)),
             BoundaryCondition::Outgoing,
             BoundaryCondition::Outgoing,
         );
@@ -2484,8 +2774,8 @@ mod tests {
         let modes = slab.solve_complex(
             om,
             Polarization::TE,
-            (1.0 + 1e-6, 2.0 - 1e-6),
-            (-0.5, -1e-3),
+            Some((1.0 + 1e-6, 2.0 - 1e-6)),
+            Some((-0.5, -1e-3)),
             BoundaryCondition::Outgoing,
             BoundaryCondition::Outgoing,
         );
@@ -2521,8 +2811,8 @@ mod tests {
             let modes = slab.solve_complex(
                 om,
                 Polarization::TE,
-                re_range,
-                im_range,
+                Some(re_range),
+                Some(im_range),
                 BoundaryCondition::Outgoing,
                 BoundaryCondition::Outgoing,
             );
@@ -2544,5 +2834,167 @@ mod tests {
             prev_im.is_some(),
             "Expected QNMs for at least one gap thickness"
         );
+    }
+
+    // ── Adaptive solver tests ────────────────────────────────────────────────
+
+    /// The adaptive solver (no explicit ranges) must find the weakly leaky
+    /// mode at t=1.5 µm, which was previously a coverage gap (Im ≈ 1e-9,
+    /// below the old default im_min=1e-3 but above the real-axis threshold).
+    #[test]
+    fn test_adaptive_finds_weakly_leaky_mode() {
+        // One-sided leaky mode: left SemiInfinite, right Outgoing.
+        // t=1.5 µm → Im(neff) ≈ 1e-9, previously a coverage gap.
+        let mut ml = MultiLayer::new(vec![
+            Layer::from_real(1.0, 1.0),
+            Layer::from_real(2.0, 0.6),
+            Layer::from_real(1.0, 1.5),
+            Layer::from_real(2.2, 1.0),
+        ]);
+        ml.set_right_boundary(BoundaryCondition::Outgoing);
+        let om = 2.0 * PI / 1.55;
+        let modes = ml.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::Outgoing,
+        );
+        assert!(
+            !modes.is_empty(),
+            "Adaptive solver should find the weakly leaky mode at t=1.5µm"
+        );
+        let mode = modes[0];
+        assert!(
+            (mode.re - 1.8043).abs() < 0.01,
+            "Re(neff) should be ≈ 1.8043, got {:.6}",
+            mode.re
+        );
+        // Im should be very small (≈ 1e-9 or zero from fallback).
+        assert!(
+            mode.im.abs() < 1e-6,
+            "|Im(neff)| should be tiny for weakly leaky mode, got {:.6e}",
+            mode.im
+        );
+    }
+
+    /// The adaptive solver must find the QNM for a strongly leaky structure
+    /// (t=0.5 µm) without explicit ranges, even though the QNM's Re(neff) is
+    /// shifted far from the isolated-core guided mode's Re(neff).
+    #[test]
+    fn test_adaptive_finds_qnm_no_ranges() {
+        let slab = create_leaky_slab(0.5);
+        let om = 2.0 * PI / 1.55;
+        let modes = slab.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            None,
+            BoundaryCondition::Outgoing,
+            BoundaryCondition::Outgoing,
+        );
+        assert!(!modes.is_empty(), "Adaptive solver should find the QNM");
+        let mode = modes[0];
+        assert!(
+            mode.im < 0.0,
+            "QNM Im(neff) must be < 0, got {:.6e}",
+            mode.im
+        );
+        assert!(
+            (mode.re - 1.526).abs() < 0.01,
+            "QNM Re(neff) should be ≈ 1.526, got {:.6}",
+            mode.re
+        );
+    }
+
+    /// Explicit ranges must preserve the legacy single-rectangle behaviour:
+    /// passing im_range=(1e-3, 0.15) on a weakly leaky structure (Im ≈ 1e-9)
+    /// should return no mode, because the mode is below the im_min floor.
+    #[test]
+    fn test_adaptive_explicit_ranges_preserve_legacy() {
+        let mut ml = MultiLayer::new(vec![
+            Layer::from_real(1.0, 1.0),
+            Layer::from_real(2.0, 0.6),
+            Layer::from_real(1.0, 1.5),
+            Layer::from_real(2.2, 1.0),
+        ]);
+        ml.set_right_boundary(BoundaryCondition::Outgoing);
+        let om = 2.0 * PI / 1.55;
+        // Explicit im_range that excludes the weakly leaky mode.
+        let modes = ml.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            Some((1e-3, 0.15)),
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::Outgoing,
+        );
+        // The weakly leaky mode (Im ≈ 1e-9) is below im_min=1e-3, so it should
+        // not be found. (The TE1 mode at Re≈1.19, Im≈4e-5 is also below 1e-3.)
+        // So we expect either no modes or modes with Im > 1e-3.
+        for mode in &modes {
+            assert!(
+                mode.im.abs() >= 1e-3,
+                "Legacy path should not find modes below im_min=1e-3, got Im={:.6e}",
+                mode.im
+            );
+        }
+    }
+
+    /// The adaptive solver must find the lossy guided mode without explicit
+    /// ranges, with Im(neff) < 0 (loss) and Re(neff) close to the lossless value.
+    #[test]
+    fn test_adaptive_lossy_guided() {
+        let slab = MultiLayer::new(vec![
+            Layer::from_real(1.0, 1.0),
+            Layer::from_complex(Complex::new(2.0, -0.01), 0.6),
+            Layer::from_real(1.0, 1.0),
+        ]);
+        let om = 2.0 * PI / 1.55;
+        let modes = slab.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert!(
+            !modes.is_empty(),
+            "Adaptive solver should find the lossy mode"
+        );
+        let mode = modes[0];
+        assert!(
+            (mode.re - 1.8043).abs() < 0.01,
+            "Re(neff) should be ≈ 1.8043"
+        );
+        assert!(mode.im < 0.0, "Im(neff) should be < 0 for lossy core");
+    }
+
+    /// The adaptive solver must find the lossless guided mode without explicit
+    /// ranges, with Im(neff) = 0.
+    #[test]
+    fn test_adaptive_lossless_guided() {
+        let slab = create_slab_multilayer();
+        let om = 2.0 * PI / 1.55;
+        let modes = slab.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert!(
+            !modes.is_empty(),
+            "Adaptive solver should find guided modes"
+        );
+        let mode = modes[0];
+        assert!(
+            (mode.re - 1.8043).abs() < 0.01,
+            "Re(neff) should be ≈ 1.8043"
+        );
+        assert!(mode.im.abs() < 1e-10, "Im(neff) should be 0 for lossless");
     }
 }

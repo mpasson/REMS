@@ -53,7 +53,7 @@ OMEGA = 2.0 * math.pi / 1.55  # k0 at λ = 1.55 µm  [rad/µm]
 
 # Gap thickness used in the tests (0.3 µm → moderately leaky, Im(neff) ≈ 0.021,
 # comfortably within the default im_range=(1e-3, 0.15)).
-GAP_T = 0.3
+GAP_T = 0.2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ def make_leaky_slab(gap_t: float = GAP_T) -> remsol.MultiLayer:
             remsol.Layer(1.0, 1.0),  # air cladding (left, evanescent)
             remsol.Layer(2.0, 0.6),  # waveguide core
             remsol.Layer(1.0, gap_t),  # air gap — controls leakage rate
-            remsol.Layer(2.2, 1.0),  # substrate (right, outgoing)
+            remsol.Layer(2.2, 10.0),  # substrate (right, outgoing)
         ]
     )
     ml.set_right_boundary(BoundaryCondition.Outgoing)

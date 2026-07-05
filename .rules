@@ -260,7 +260,33 @@ ml.set_right_boundary(BoundaryCondition.Outgoing)
 re, im = ml.complex_neff(omega)   # im > 0
 ```
 
-**Search strategy for weakly leaky modes** (winding-number sensitivity):
+**Adaptive search (default — no `re_range`/`im_range` needed):**
+
+When `complex_neff` / `all_complex_neff` / `complex_field` are called **without**
+explicit `re_range` and `im_range`, the solver uses an adaptive multi-rectangle
+search that handles the full range of mode types (strongly leaky, weakly leaky,
+QNM, lossy, lossless) without user tuning. The adaptive search runs:
+
+1. **Real-axis probe** — the fast real-axis solver (`solve`) finds guided-mode
+   candidates. For lossless + both-`SemiInfinite` structures these are the modes.
+   For leaky/QNM structures where the full stack has no guided mode, an
+   *isolated-core* probe (lowest-index cladding | interior layers | cladding)
+   provides `Re(neff)` hints that seed narrow `re` windows.
+2. **Broad `im` window** — one broad-`Im` rectangle (the old default) catches
+   strongly leaky/lossy modes.
+3. **`Im` decade cascade** — four geometrically well-conditioned windows
+   (`(1e-3,1e-1)`, `(1e-5,1e-2)`, `(1e-7,1e-3)`, `(1e-9,1e-4)`) covering
+   `|Im|` from `1e-1` down to `1e-9`. Sign follows the BCs (negative for QNM,
+   positive for leaky). Each window's `re` range is sub-divided to keep the
+   aspect ratio bounded (target ≈ 10:1).
+4. **Real-axis fallback** — if the cascade finds nothing but the probe did,
+   emit the real-axis mode with `Im = 0`. Disabled for QNM BCs (both `Outgoing`),
+   where a real root is unphysical.
+
+This closes the former coverage gap at `Im ≈ 1e-9` (weakly leaky modes with large
+ gaps) that required the manual cascade below.
+
+**Manual search strategy (optional, for pathological cases):**
 
 The winding-number contour requires `im_max` to be roughly **40× larger** than the
 actual `Im(neff)` value for reliable pole counting. When multiple modes with very
@@ -494,9 +520,11 @@ git push && git push --tags
   complex neff search (which provides the input neff) requires semi-infinite boundaries.
 - When using `Outgoing` boundary conditions with `complex_neff`, the winding-number
   algorithm requires `im_max` to be roughly 40× larger than the actual `Im(neff)` for
-  reliable counting; use a restricted `re_range` to isolate individual modes when
-  multiple resonances are present. For very weakly leaky modes (`Im < ~1e-11`, large
-  gap), use the real-axis solver instead.
+  reliable counting. The **adaptive search** (default, no explicit `re_range`/`im_range`)
+  handles this automatically via a decade cascade. For pathological cases where the
+  adaptive search fails, use a restricted `re_range` to isolate individual modes.
+  For very weakly leaky modes (`Im < ~1e-11`, large gap), the adaptive search falls
+  back to the real-axis solver automatically.
 - The `index()` method returns only `Re(n)` for plotting; imaginary parts of the index
   profile are not currently visualised.
 - **Power normalization** (`Normalization.Power`) is only physically meaningful for
