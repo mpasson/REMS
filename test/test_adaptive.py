@@ -70,7 +70,18 @@ def test_adaptive_finds_weakly_leaky_mode():
     assert result is not None, "Adaptive solver should find the weakly leaky mode"
     re_neff, im_neff = result
     assert abs(re_neff - 1.8043) < 0.01, f"Re(neff)={re_neff:.6f} should be ≈ 1.8043"
-    assert abs(im_neff) < 1e-6, f"|Im(neff)|={im_neff:.2e} should be tiny"
+    assert 0.0 <= im_neff < 1e-6, f"Im(neff)={im_neff:.2e} should be nonnegative and tiny"
+
+
+def test_adaptive_rejects_root_outside_leaky_half_plane():
+    """Muller polishing must not return the conjugate root below the real axis."""
+    ml = make_leaky_slab(0.955_555_555_556)
+    modes = ml.all_complex_neff(OMEGA, rs.Polarization.TE)
+
+    assert modes, "Adaptive solver should find the one-sided leaky mode"
+    assert all(im >= 0.0 for _, im in modes), modes
+    assert modes[0][0] == pytest.approx(1.804_297_53, abs=1e-6)
+    assert modes[0][1] == pytest.approx(9.568_45e-7, abs=1e-9)
 
 
 # ── Full leaky sweep ─────────────────────────────────────────────────────────

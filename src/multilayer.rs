@@ -1071,11 +1071,16 @@ impl MultiLayer {
             if let Some(root) = self.muller_polish(k0, initial_guess, char_fn) {
                 // Accept only if the root is inside (or very close to) the rectangle.
                 let neff_root = root / k0;
-                let margin = 1e-6;
-                if neff_root.re >= re_min - margin
-                    && neff_root.re <= re_max + margin
-                    && neff_root.im >= im_min - margin
-                    && neff_root.im <= im_max + margin
+                // Muller can converge to a nearby root just outside the
+                // counted rectangle. Keep the tolerance at polishing precision
+                // so near-real adaptive windows cannot admit a conjugate root
+                // from the opposite half-plane.
+                let re_margin = 1e-9 * re_min.abs().max(re_max.abs()).max(1.0);
+                let im_margin = 1e-9 * im_min.abs().max(im_max.abs()).max(1.0);
+                if neff_root.re >= re_min - re_margin
+                    && neff_root.re <= re_max + re_margin
+                    && neff_root.im >= im_min - im_margin
+                    && neff_root.im <= im_max + im_margin
                 {
                     // De-duplicate: discard if a root already found is very close.
                     let is_duplicate = roots.iter().any(|&r| (r - root).norm() < 1e-8 * k0);
@@ -1342,7 +1347,7 @@ impl MultiLayer {
 
     /// Adaptive multi-rectangle complex-mode search.
     ///
-    /// Replaces the single fixed rectangle of the legacy path with a four-stage
+    /// Replaces the single fixed rectangle of the legacy path with a multi-stage
     /// search that needs no user-supplied `re_range` / `im_range` for reasonable
     /// structures:
     ///
@@ -1355,6 +1360,9 @@ impl MultiLayer {
     ///   old default) to catch strongly leaky / strongly lossy modes.
     /// - **Stage C — `Im` decade cascade.** Four geometrically well-conditioned
     ///   windows (see [`im_cascade`]) covering `|Im|` from `1e-1` down to `1e-9`.
+    /// - **Stage C2 - near-real recovery.** For one-sided leakage, search a
+    ///   tiny symmetric box around each real-axis hint to recover modes at
+    ///   the 1e-9 cascade boundary without widening the broad search.
     /// - **Stage D — real-axis fallback.** If the cascade found no complex root
     ///   but the probe did, emit the real-axis mode with `Im = 0`. Disabled for
     ///   QNM BCs (both `Outgoing`), where a real root is unphysical.
@@ -1454,7 +1462,8 @@ impl MultiLayer {
         // whose Re(neff) is shifted far from the probe (e.g. strongly leaky QNMs).
         let (min_n, max_n) = self.find_minmax_n();
         let broad_re = (min_n.max(0.0), max_n + 1e-6);
-        let mut re_windows: Vec<(f64, f64)> = Self::narrow_re_windows(&real_probe);
+        let narrow_re_windows = Self::narrow_re_windows(&real_probe);
+        let mut re_windows = narrow_re_windows.clone();
         re_windows.push(broad_re);
 
         let mut roots: Vec<Complex<f64>> = Vec::new();
@@ -1499,7 +1508,30 @@ impl MultiLayer {
             // runs after the loop.
         }
 
-        // ── Stage D: real-axis fallback ───────────────────────────────────────
+        // Stage C2: near-real one-sided recovery
+        // The deepest positive-only cascade starts at Im(neff)=1e-9. A mode
+        // close to that boundary can be missed because the contour passes too
+        // close to the pole. Search a tiny symmetric box around real-axis hints
+        // to put such effectively guided roots safely inside the contour. This
+        // pass is restricted to narrow hint windows so it does not expose the
+        // broad search to real-axis branch-cut artefacts.
+        if one_outgoing {
+            const NEAR_REAL_HALF_WIDTH: f64 = 1e-8;
+            for &(re_min, re_max) in &narrow_re_windows {
+                self.find_zeros_in_rectangle(
+                    k0,
+                    re_min,
+                    re_max,
+                    -NEAR_REAL_HALF_WIDTH,
+                    NEAR_REAL_HALF_WIDTH,
+                    0,
+                    &mut roots,
+                    &char_fn,
+                );
+            }
+        }
+
+        // Stage D: real-axis fallback
         // If the cascade found nothing and the full-structure probe found a
         // real-axis mode, the mode is effectively guided (|Im| < 1e-9). Emit it
         // with Im = 0 — unless we are under QNM BCs, where a real root is
@@ -2913,10 +2945,44 @@ mod tests {
         );
         // Im should be very small (≈ 1e-9 or zero from fallback).
         assert!(
-            mode.im.abs() < 1e-6,
-            "|Im(neff)| should be tiny for weakly leaky mode, got {:.6e}",
+            mode.im >= 0.0 && mode.im < 1e-6,
+            "Im(neff) should be nonnegative and tiny, got {:.6e}",
             mode.im
         );
+    }
+
+    /// Muller polishing must not admit the conjugate root from outside the
+    /// positive-imaginary search windows used for a one-sided leaky mode.
+    #[test]
+    fn test_adaptive_rejects_root_outside_leaky_half_plane() {
+        let mut ml = MultiLayer::new(vec![
+            Layer::from_real(1.0, 1.0),
+            Layer::from_real(2.0, 0.6),
+            Layer::from_real(1.0, 0.955_555_555_556),
+            Layer::from_real(2.2, 1.0),
+        ]);
+        ml.set_right_boundary(BoundaryCondition::Outgoing);
+        let om = 2.0 * PI / 1.55;
+
+        let modes = ml.solve_complex(
+            om,
+            Polarization::TE,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::Outgoing,
+        );
+
+        assert!(
+            !modes.is_empty(),
+            "Adaptive solver should find the leaky mode"
+        );
+        assert!(
+            modes.iter().all(|mode| mode.im >= 0.0),
+            "One-sided leaky search returned a root outside its half-plane: {modes:?}"
+        );
+        assert!((modes[0].re - 1.804_297_53).abs() < 1e-6);
+        assert!((modes[0].im - 9.568_45e-7).abs() < 1e-9);
     }
 
     /// The adaptive solver must find the QNM for a strongly leaky structure

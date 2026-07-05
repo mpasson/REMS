@@ -270,7 +270,7 @@ QNM, lossy, lossless) without user tuning. The adaptive search runs:
 1. **Real-axis probe** — the fast real-axis solver (`solve`) finds guided-mode
    candidates. For lossless + both-`SemiInfinite` structures these are the modes.
    For leaky/QNM structures where the full stack has no guided mode, an
-   *isolated-core* probe (lowest-index cladding | interior layers | cladding)
+   *isolated-system* probe (lower-index exterior cladding | interior layers | cladding)
    provides `Re(neff)` hints that seed narrow `re` windows.
 2. **Broad `im` window** — one broad-`Im` rectangle (the old default) catches
    strongly leaky/lossy modes.
@@ -279,7 +279,10 @@ QNM, lossy, lossless) without user tuning. The adaptive search runs:
    `|Im|` from `1e-1` down to `1e-9`. Sign follows the BCs (negative for QNM,
    positive for leaky). Each window's `re` range is sub-divided to keep the
    aspect ratio bounded (target ≈ 10:1).
-4. **Real-axis fallback** — if the cascade finds nothing but the probe did,
+4. **Near-real one-sided recovery** - a tiny symmetric imaginary window
+   around each isolated-system hint recovers modes that sit directly on the
+   1e-9 boundary of the positive-only cascade.
+5. **Real-axis fallback** — if the cascade finds nothing but the probe did,
    emit the real-axis mode with `Im = 0`. Disabled for QNM BCs (both `Outgoing`),
    where a real root is unphysical.
 
