@@ -7,3 +7,4 @@ Next section contains examples on how to use the REMSOL package.
 - {doc}`sweep`.
 - {doc}`one_sided_qnm`.
 - {doc}`surface_plasmon`.
+- {doc}`bloch_surface_wave`.
