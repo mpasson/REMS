@@ -42,6 +42,24 @@ def make_leaky_slab(gap_t: float) -> rs.MultiLayer:
     return ml
 
 
+def make_multilayer_leaky_stack(*, both_outgoing: bool = False) -> rs.MultiLayer:
+    """Build a coupled-core stack with five finite-material interfaces."""
+    ml = rs.MultiLayer(
+        [
+            rs.Layer(1.0, 1.0),
+            rs.Layer(2.2, 0.25),
+            rs.Layer(1.45, 0.18),
+            rs.Layer(2.0, 0.35),
+            rs.Layer(1.0, 0.8),
+            rs.Layer(2.4, 1.0),
+        ]
+    )
+    if both_outgoing:
+        ml.set_left_boundary(rs.BoundaryCondition.Outgoing)
+    ml.set_right_boundary(rs.BoundaryCondition.Outgoing)
+    return ml
+
+
 # ── Weakly leaky mode (the former coverage gap) ──────────────────────────────
 
 
@@ -67,7 +85,7 @@ def test_adaptive_leaky_sweep_finds_mode(gap_t):
     result = ml.complex_neff(OMEGA, rs.Polarization.TE)
     assert result is not None, f"No mode found for gap t={gap_t} µm"
     re_neff, im_neff = result
-    # Re(neff) should be close to the isolated-core guided mode (≈ 1.8043).
+    # Re(neff) should be close to the isolated-system guided mode (≈ 1.8043).
     assert abs(re_neff - 1.8043) < 0.02, (
         f"Re(neff)={re_neff:.6f} should be ≈ 1.8043 for gap t={gap_t}"
     )
@@ -115,6 +133,57 @@ def test_adaptive_qnm_no_ranges():
     assert 1.0 < re_neff < 2.2, f"QNM Re(neff)={re_neff:.6f} outside (1.0, 2.2)"
 
 
+def test_adaptive_multilayer_qnm_no_ranges():
+    """A coupled-core QNM is found without reducing the stack to one core layer."""
+    ml = make_multilayer_leaky_stack(both_outgoing=True)
+    result = ml.complex_neff(OMEGA, rs.Polarization.TE)
+    assert result is not None, "Adaptive solver should find the multilayer QNM"
+    re_neff, im_neff = result
+    assert re_neff == pytest.approx(1.6506, abs=0.01)
+    assert im_neff < 0.0, f"QNM Im(neff) must be < 0, got {im_neff:.6e}"
+
+
+# ── General multilayer structures ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("polarization", "expected_re"),
+    [
+        (rs.Polarization.TE, 1.7967),
+        (rs.Polarization.TM, 1.6100),
+    ],
+)
+def test_adaptive_coupled_core_leaky_modes(polarization, expected_re):
+    """The default search handles a multilayer core for both polarizations."""
+    modes = make_multilayer_leaky_stack().all_complex_neff(OMEGA, polarization)
+    assert len(modes) >= 2, "Expected both coupled-core leaky modes"
+    assert modes[0][0] == pytest.approx(expected_re, abs=0.01)
+    assert all(im >= 0.0 for _, im in modes), modes
+
+
+def test_adaptive_isolated_probe_uses_external_cladding():
+    """An internal low-index spacer must remain part of the isolated device."""
+    interior = [
+        rs.Layer(2.25, 0.3),
+        rs.Layer(1.0, 0.15),
+        rs.Layer(2.05, 0.4),
+        rs.Layer(1.35, 0.9),
+    ]
+    isolated = rs.MultiLayer([rs.Layer(1.3, 1.0), *interior, rs.Layer(1.3, 1.0)])
+    reference_modes = isolated.all_neff(OMEGA, rs.Polarization.TE)
+    assert len(reference_modes) >= 2
+
+    leaky = rs.MultiLayer([rs.Layer(1.3, 1.0), *interior, rs.Layer(2.5, 1.0)])
+    leaky.set_right_boundary(rs.BoundaryCondition.Outgoing)
+    adaptive_modes = leaky.all_complex_neff(OMEGA, rs.Polarization.TE)
+
+    for reference_re in reference_modes[:2]:
+        assert any(abs(re - reference_re) < 0.01 for re, _ in adaptive_modes), (
+            f"No adaptive leaky mode found near isolated mode {reference_re:.6f}: "
+            f"{adaptive_modes}"
+        )
+
+
 # ── Lossy guided ─────────────────────────────────────────────────────────────
 
 
@@ -132,6 +201,24 @@ def test_adaptive_lossy_guided():
     re_neff, im_neff = result
     assert abs(re_neff - 1.8043) < 0.01, f"Re(neff)={re_neff:.6f} should be ≈ 1.8043"
     assert im_neff < 0.0, f"Im(neff)={im_neff:.6e} should be < 0 for lossy core"
+
+
+def test_adaptive_lossy_coupled_core_finds_multiple_modes():
+    """Material loss is handled for an asymmetric multilayer coupled core."""
+    ml = rs.MultiLayer(
+        [
+            rs.Layer(1.2, 1.0),
+            rs.Layer(2.2 - 0.008j, 0.25),
+            rs.Layer(1.45, 0.18),
+            rs.Layer(2.0 - 0.004j, 0.35),
+            rs.Layer(1.3, 1.0),
+        ]
+    )
+    modes = ml.all_complex_neff(OMEGA, rs.Polarization.TE)
+    assert len(modes) >= 2, "Expected both lossy coupled-core modes"
+    assert modes[0][0] == pytest.approx(1.8106, abs=0.01)
+    assert modes[1][0] == pytest.approx(1.5544, abs=0.01)
+    assert all(im < 0.0 for _, im in modes), modes
 
 
 # ── Lossless guided ──────────────────────────────────────────────────────────

@@ -1298,36 +1298,46 @@ impl MultiLayer {
         kept
     }
 
-    /// Builds an isolated-core probe for the real-axis solver.
+    /// Builds the corresponding isolated system for an arbitrary multilayer.
     ///
-    /// Constructs a 3-layer stack: lowest-index cladding | core layers |
-    /// lowest-index cladding, where the "core layers" are all interior layers
-    /// of the original stack (i.e. `self.layers[1..n-1]`). Runs the real-axis
-    /// solver on this simplified stack to find guided-mode Re(neff) candidates.
+    /// Every finite interior layer is preserved, while both semi-infinite
+    /// exterior layers are replaced by the lower-index of the two original
+    /// claddings. Restricting the cladding choice to the exterior layers is
+    /// important: a low-index spacer inside a coupled-core structure is part of
+    /// the device and must not become the artificial surrounding medium.
+    fn isolated_system(&self) -> Option<MultiLayer> {
+        if self.layers.len() < 3 {
+            return None;
+        }
+
+        let left_cladding = self.layers.first()?;
+        let right_cladding = self.layers.last()?;
+        let isolation_cladding = if left_cladding.n.re <= right_cladding.n.re {
+            *left_cladding
+        } else {
+            *right_cladding
+        };
+
+        let mut isolated_layers = Vec::with_capacity(self.layers.len());
+        isolated_layers.push(isolation_cladding);
+        isolated_layers.extend_from_slice(&self.layers[1..self.layers.len() - 1]);
+        isolated_layers.push(isolation_cladding);
+        Some(MultiLayer::new(isolated_layers))
+    }
+
+    /// Builds an isolated-system probe for the real-axis solver.
+    ///
+    /// Runs the real-axis solver on [`isolated_system`](Self::isolated_system)
+    /// to find guided-mode Re(neff) candidates for an arbitrary number of
+    /// interior layers.
     ///
     /// This is used by [`adaptive_solve_complex`] when the full stack has no
-    /// guided mode (e.g. `n_substrate > n_core`): the leaky mode's Re(neff) is
-    /// typically close to the isolated-core guided mode's Re(neff), so the
-    /// probe seeds narrow `re` windows for the complex cascade.
-    fn isolated_core_probe(&self, k0: f64, polarization: Polarization) -> Vec<f64> {
-        if self.layers.len() < 3 {
-            return Vec::new();
-        }
-        // Find the lowest real index among all layers (use Re(n)).
-        let min_n_re = self
-            .layers
-            .iter()
-            .map(|l| l.n.re)
-            .fold(f64::INFINITY, f64::min);
-        // Build the isolated core: cladding | interior layers | cladding.
-        let mut iso_layers = Vec::with_capacity(self.layers.len() + 1);
-        iso_layers.push(Layer::from_real(min_n_re, 1.0));
-        for layer in &self.layers[1..self.layers.len() - 1] {
-            iso_layers.push(layer.clone());
-        }
-        iso_layers.push(Layer::from_real(min_n_re, 1.0));
-        let iso_ml = MultiLayer::new(iso_layers);
-        iso_ml.solve(k0, polarization)
+    /// guided mode (for example, `n_substrate > n_core`). The leaky mode
+    /// typically stays close to the isolated-system Re(neff), so the probe
+    /// seeds narrow `re` windows for the complex cascade.
+    fn isolated_system_probe(&self, k0: f64, polarization: Polarization) -> Vec<f64> {
+        self.isolated_system()
+            .map_or_else(Vec::new, |isolated| isolated.solve(k0, polarization))
     }
 
     /// Adaptive multi-rectangle complex-mode search.
@@ -1377,13 +1387,13 @@ impl MultiLayer {
         // re windows for the complex cascade.
         //
         // For leaky/QNM structures where the full stack has no guided mode
-        // (e.g. n_substrate > n_core), we also probe the *isolated core* — the
-        // stack with both claddings replaced by the lowest-index material — to
+        // (e.g. n_substrate > n_core), we also probe the *isolated system* — the
+        // stack with both claddings replaced by the lower-index original exterior cladding — to
         // get a Re(neff) hint for the leaky mode. The leaky mode's Re(neff) is
-        // typically close to the isolated-core guided mode's Re(neff).
+        // typically close to the isolated-system guided mode's Re(neff).
         //
         // `full_probe` is used for the real-axis fallback (stage D);
-        // `re_hints` combines full_probe + isolated-core probe and is used only
+        // `re_hints` combines full_probe + isolated-system probe and is used only
         // to seed narrow re windows for the complex cascade.
         let full_probe: Vec<f64> = if all_lossless {
             self.solve(k0, polarization)
@@ -1392,7 +1402,7 @@ impl MultiLayer {
         };
         let mut re_hints = full_probe.clone();
         if re_hints.is_empty() && all_lossless && (both_outgoing || one_outgoing) {
-            re_hints = self.isolated_core_probe(k0, polarization);
+            re_hints = self.isolated_system_probe(k0, polarization);
         }
         let real_probe = re_hints;
 
@@ -1493,7 +1503,7 @@ impl MultiLayer {
         // If the cascade found nothing and the full-structure probe found a
         // real-axis mode, the mode is effectively guided (|Im| < 1e-9). Emit it
         // with Im = 0 — unless we are under QNM BCs, where a real root is
-        // unphysical. We use `full_probe` (not the isolated-core hints) so we
+        // unphysical. We use `full_probe` (not the isolated-system hints) so we
         // don't emit a spurious real mode from a different structure.
         if !both_outgoing {
             for &n_re in &full_probe {
@@ -2838,6 +2848,36 @@ mod tests {
 
     // ── Adaptive solver tests ────────────────────────────────────────────────
 
+    /// The isolated-system probe must preserve every finite layer in a general
+    /// multilayer and choose its artificial cladding from the two original
+    /// exterior layers, not from a lower-index internal spacer.
+    #[test]
+    fn test_isolated_system_preserves_arbitrary_multilayer_interior() {
+        let stack = MultiLayer::new(vec![
+            Layer::from_real(1.3, 1.0),
+            Layer::from_real(2.25, 0.3),
+            Layer::from_real(1.0, 0.15),
+            Layer::from_real(2.05, 0.4),
+            Layer::from_real(1.35, 0.9),
+            Layer::from_real(2.5, 1.0),
+        ]);
+
+        let isolated = stack
+            .isolated_system()
+            .expect("a stack with finite interior layers should be isolatable");
+
+        assert_eq!(isolated.layers.len(), stack.layers.len());
+        assert!((isolated.layers[0].n.re - 1.3).abs() < 1e-12);
+        assert!((isolated.layers.last().unwrap().n.re - 1.3).abs() < 1e-12);
+        for (actual, expected) in isolated.layers[1..isolated.layers.len() - 1]
+            .iter()
+            .zip(&stack.layers[1..stack.layers.len() - 1])
+        {
+            assert!((actual.n - expected.n).norm() < 1e-12);
+            assert!((actual.d - expected.d).abs() < 1e-12);
+        }
+    }
+
     /// The adaptive solver (no explicit ranges) must find the weakly leaky
     /// mode at t=1.5 µm, which was previously a coverage gap (Im ≈ 1e-9,
     /// below the old default im_min=1e-3 but above the real-axis threshold).
@@ -2881,7 +2921,7 @@ mod tests {
 
     /// The adaptive solver must find the QNM for a strongly leaky structure
     /// (t=0.5 µm) without explicit ranges, even though the QNM's Re(neff) is
-    /// shifted far from the isolated-core guided mode's Re(neff).
+    /// shifted far from the isolated-system guided mode's Re(neff).
     #[test]
     fn test_adaptive_finds_qnm_no_ranges() {
         let slab = create_leaky_slab(0.5);

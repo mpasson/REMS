@@ -8,4 +8,5 @@ chapters:
     sections:
       - file: examples/slab
       - file: examples/sweep
+      - file: examples/one_sided_qnm
   - file: api
