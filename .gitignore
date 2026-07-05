@@ -10,3 +10,7 @@ docs/_build
 .DS_Store
 .secrets
 *.png
+plans
+
+# Local Codex settings
+.codex/

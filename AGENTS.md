@@ -1,4 +1,4 @@
-# REMSOL — Zed AI Assistant Rules
+# REMSOL Repository Instructions
 
 ## Project Overview
 
@@ -149,15 +149,17 @@ uv run maturin develop --uv --release
   override to `complex_neff` / `all_complex_neff`.
 
 ### Backends
-- **Transfer Matrix Method (TMM)** — `BackEnd::Transfer` — supports both `neff()` and
-  `field()` / `field_complex()`. Default backend.
-- **Scattering Matrix Method (SMM)** — `BackEnd::Scattering` — supports `neff()` only;
-  field calculation is not implemented.
-- The complex-plane mode search (`complex_neff` / `all_complex_neff`) **always uses the
-  SMM**, regardless of the `backend` setting, because the SMM is unconditionally
-  numerically stable for complex `k` (it never forms products of exponentially growing
-  and decaying terms in the same matrix element).
-- Field reconstruction (`field()` and `field_complex()`) always uses the TMM backend.
+- **Transfer Matrix Method (TMM)** - `BackEnd::Transfer` - is the default.
+  It supports real-axis `neff()` / `all_neff()` and field reconstruction.
+- **Scattering Matrix Method (SMM)** - `BackEnd::Scattering` - supports
+  real-axis `neff()` / `all_neff()`, but not field reconstruction.
+- Complex-plane searches (`complex_neff()` / `all_complex_neff()`) always use
+  SMM regardless of the selected backend because SMM remains stable for complex `k`.
+- `field()` requires the Transfer backend. `complex_field()` is hybrid: it uses
+  SMM for the complex mode search and TMM for field reconstruction, and therefore
+  also requires `BackEnd.Transfer` to be selected.
+- Calling `field()` or `complex_field()` with `BackEnd.Scattering`
+  currently reaches the unimplemented SMM coefficient path and panics.
 
 ---
 
@@ -514,8 +516,9 @@ git push && git push --tags
 ## Known Limitations and Out-of-Scope Items
 
 - Only **1D planar** structures; no 2D or 3D geometries.
-- The **SMM backend does not support field calculation** (`field()` and `complex_field()`
-  always use the TMM backend regardless of `MultiLayer.backend`).
+- The **SMM backend does not support field reconstruction**. Calling
+  `field()` or `complex_field()` while `BackEnd.Scattering` is selected
+  currently panics; select the Transfer backend for either field method.
 - The **complex-plane solver does not support PEC boundary conditions** — when `left_bc`
   or `right_bc` is `PEC`, the S-matrix treats it as `SemiInfinite`. PEC is only
   meaningful for the real-axis TMM solver.
