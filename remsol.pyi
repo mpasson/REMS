@@ -128,12 +128,10 @@ class MultiLayer:
       wavevector axis.  Finds only lossless guided modes.  Use this for the
       common case of real refractive indices.
 
-    * **Complex-plane solver** (``complex_neff`` / ``all_complex_neff``): uses
-      the argument principle (winding-number method) to locate zeros of the
-      scattering-matrix determinant in a rectangle of the complex *neff* plane,
-      then polishes each zero with Muller's method.  Finds lossy guided modes
-      (when layers have ``Im(n) != 0``) and leaky modes (when ``Re(neff)`` falls
-      below the cladding index).
+    * **Complex solver** (``complex_neff`` / ``all_complex_neff``): exact
+      unsquared interface condition for a two-layer structure; argument-principle
+      search of the scattering-matrix determinant for larger stacks. Finds lossy
+      guided modes and leaky or quasi-normal modes.
     """
 
     plot_step: float
@@ -198,8 +196,9 @@ class MultiLayer:
     ) -> float | None:
         """Calculate the effective index of refraction for a given guided mode.
 
-        Uses the fast real-axis scan.  Only finds modes with purely real
-        ``neff``; for lossy or leaky structures use :meth:`complex_neff`.
+        Uses the fast real-axis scan for multilayers. A two-layer interface uses
+        its exact TM condition and is returned only when ``neff`` is real. For
+        lossy or leaky structures use :meth:`complex_neff`.
 
         Args:
             omega: The angular frequency of the light.
@@ -241,10 +240,14 @@ class MultiLayer:
     ) -> tuple[float, float] | None:
         """Find a single complex effective index using the 2-D complex-plane solver.
 
-        The boundary conditions used to build the S-matrix are controlled by
-        ``left_bc`` / ``right_bc``.  If omitted, the BCs stored on the
-        ``MultiLayer`` object are used (set via :meth:`set_left_boundary` /
-        :meth:`set_right_boundary` or defaulting to ``SemiInfinite``).
+        For exactly two layers, the exact unsquared interface condition is used
+        instead of the S-matrix determinant. Omitted ranges do not constrain the
+        candidate; supplied ``re_range`` and ``im_range`` values filter it
+        independently.
+
+        For larger stacks, boundary conditions used to build the S-matrix are
+        controlled by ``left_bc`` / ``right_bc``. If omitted, stored BCs are
+        used (set via :meth:`set_left_boundary` / :meth:`set_right_boundary`).
 
         | ``left_bc``    | ``right_bc``   | Mode type                              |
         |----------------|----------------|----------------------------------------|
@@ -371,9 +374,9 @@ class MultiLayer:
         :meth:`complex_neff`).  Field reconstruction always uses the TMM with
         ``SemiInfinite`` conditions regardless of the BCs used in the search.
 
-        For semi-infinite boundaries the outgoing wave in the rightmost layer is
-        **not** zeroed: for a complex neff the radiation condition is already
-        encoded in the imaginary part.
+        A physical two-layer TM interface uses the closed-form field relations,
+        enforcing continuity of ``Hy`` and ``epsilon * Ez``. Larger stacks
+        retain the TMM coefficient reconstruction.
 
         If ``Normalization.Power`` is set and the found ``neff`` has a nonzero
         imaginary part, a warning is emitted via Python’s ``logging`` module and

@@ -13,31 +13,30 @@ built with [Maturin](https://github.com/PyO3/maturin).
 
 ## Capabilities
 
-- **Mode solving** — computes the effective refractive indices (`neff`) of all guided
-  modes supported by a given layer stack at a given free-space wavenumber `k₀ = 2π/λ`.
-- **Both polarizations** — full support for TE (transverse electric) and TM (transverse
-  magnetic) polarizations.
-- **Field profiles** — reconstructs the complete vectorial field distribution
-  (Ex, Ey, Ez, Hx, Hy, Hz) across the cross-section for any guided mode, normalized so
-  that the integrated Poynting vector equals 1.
-- **Index profile** — samples the refractive index profile of the stack for plotting
-  and inspection.
-- **Two numerical backends**:
-  - *Transfer Matrix Method (TMM)* — full-featured; supports both `neff` and `field`.
-  - *Scattering Matrix Method (SMM)* — supports `neff` only; useful as a cross-check.
-- **Boundary conditions** — each side of the stack can be set to:
-  - *Semi-infinite cladding* (default) — field decays evanescently outward.
-  - *Perfect Electric Conductor (PEC)* — tangential electric field forced to zero at
-    the wall; useful for modelling symmetric structures with half-domain tricks.
-- **Arbitrary stacks** — any number of layers, each with an independent real refractive
-  index and thickness (in µm).
+- **Real and complex mode solving** - computes guided, lossy, leaky, and quasi-normal
+  effective indices at a free-space wavenumber `k0 = 2*pi/lambda`.
+- **Exact two-layer interfaces** - a literal dielectric-metal interface uses the
+  branch-aware unsquared TM eigencondition. Larger stacks use the S-matrix
+  determinant and argument-principle search.
+- **Complex material indices** - each layer accepts a real or complex refractive
+  index and a thickness in um.
+- **Both polarizations** - supports TE and TM modes. In the nonmagnetic material
+  model, an isolated two-medium surface mode is TM.
+- **Field profiles** - reconstructs all six field components. MaxField
+  normalization is the default; unit-power normalization is available for
+  lossless guided modes.
+- **Two numerical backends** - TMM supports index finding and field reconstruction;
+  SMM supports index finding. Complex searches always use SMM for stability.
+- **Boundary conditions** - semi-infinite, PEC, and outgoing-wave boundaries are
+  available for their supported solver paths.
 
 ### Known limitations
 
-- Refractive indices are **real-valued only** (lossless, non-gain media).
-- Only **guided modes** (real `neff`) are computed; leaky modes are not supported.
 - Geometry is strictly **1D planar**; no 2D or 3D structures.
-- The SMM backend does **not** support field calculation.
+- The SMM backend does **not** support field reconstruction.
+- Complex-plane searches do **not** support PEC walls; PEC is supported by the
+  real-axis TMM solver.
+- `index()` returns only the real part of the material index for plotting.
 
 ---
 

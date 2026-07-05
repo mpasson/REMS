@@ -24,6 +24,68 @@ use crate::enums::Polarization;
 use crate::layer::Layer;
 use crate::transfer_matrix::{kz_outgoing, kz_physical};
 
+/// Selects the transverse-wavevector sheet for an exterior boundary.
+///
+/// `PEC` remains equivalent to `SemiInfinite` in the S-matrix and complex-mode
+/// code because PEC walls are supported only by the real-axis TMM solver.
+fn kz_for_boundary(
+    k0: Complex<f64>,
+    n: Complex<f64>,
+    k: Complex<f64>,
+    boundary: BoundaryCondition,
+) -> Complex<f64> {
+    match boundary {
+        BoundaryCondition::Outgoing => kz_outgoing(k0, n, k),
+        BoundaryCondition::SemiInfinite | BoundaryCondition::PEC => kz_physical(k0, n, k),
+    }
+}
+
+/// Returns the two dimensionless terms of the single-interface eigencondition.
+///
+/// The returned values use the same boundary-condition-dependent transverse
+/// wavevector sheets as [`calculate_s_matrix_with_bc`]. Their sum is the
+/// unsquared interface characteristic. For TE the terms are `kz_L / k0` and
+/// `kz_R / k0`; for TM they are `epsilon_R * kz_L / k0` and
+/// `epsilon_L * kz_R / k0`.
+pub(crate) fn interface_eigencondition_terms(
+    n_left: Complex<f64>,
+    n_right: Complex<f64>,
+    k0: Complex<f64>,
+    k: Complex<f64>,
+    polarization: Polarization,
+    left_bc: BoundaryCondition,
+    right_bc: BoundaryCondition,
+) -> (Complex<f64>, Complex<f64>) {
+    let kz_left = kz_for_boundary(k0, n_left, k, left_bc);
+    let kz_right = kz_for_boundary(k0, n_right, k, right_bc);
+    match polarization {
+        Polarization::TE => (kz_left / k0, kz_right / k0),
+        Polarization::TM => (
+            n_right.powi(2) * kz_left / k0,
+            n_left.powi(2) * kz_right / k0,
+        ),
+    }
+}
+
+/// Evaluates the dimensionless, unsquared single-interface eigencondition.
+///
+/// Zeros of this function are interface-bound modes on the sheets selected by
+/// `left_bc` and `right_bc`. In the current nonmagnetic material model only the
+/// TM condition yields an isolated bound mode between distinct materials.
+pub(crate) fn interface_eigencondition(
+    n_left: Complex<f64>,
+    n_right: Complex<f64>,
+    k0: Complex<f64>,
+    k: Complex<f64>,
+    polarization: Polarization,
+    left_bc: BoundaryCondition,
+    right_bc: BoundaryCondition,
+) -> Complex<f64> {
+    let (left, right) =
+        interface_eigencondition_terms(n_left, n_right, k0, k, polarization, left_bc, right_bc);
+    left + right
+}
+
 /// Struct representing the scattering matrix.
 #[derive(Debug)]
 pub struct ScatteringMatrix {
@@ -483,16 +545,9 @@ pub fn calculate_s_matrix_with_bc(
 ) -> ScatteringMatrix {
     debug_assert!(layers.len() >= 2, "S-matrix requires at least 2 layers");
 
-    let kz_for_bc = |n: Complex<f64>, bc: BoundaryCondition| -> Complex<f64> {
-        match bc {
-            BoundaryCondition::Outgoing => kz_outgoing(k0, n, k),
-            _ => kz_physical(k0, n, k),
-        }
-    };
-
-    let kz0 = kz_for_bc(layers[0].n, left_bc);
+    let kz0 = kz_for_boundary(k0, layers[0].n, k, left_bc);
     let kz1 = if layers.len() == 2 {
-        kz_for_bc(layers[1].n, right_bc)
+        kz_for_boundary(k0, layers[1].n, k, right_bc)
     } else {
         kz_physical(k0, layers[1].n, k)
     };
@@ -513,7 +568,7 @@ pub fn calculate_s_matrix_with_bc(
         result = result.compose(prop);
         let intf = if i + 1 == n_pairs {
             let kz_left = kz_physical(k0, layer1.n, k);
-            let kz_right = kz_for_bc(layer2.n, right_bc);
+            let kz_right = kz_for_boundary(k0, layer2.n, k, right_bc);
             ScatteringMatrix::matrix_interface_from_kz(
                 layer1.n,
                 layer2.n,
@@ -683,5 +738,76 @@ mod tests {
         // With Im(n) > 0 and Im(k) = 0, kz has Im(kz) > 0, so |phase| < 1.
         assert!(m.s11.norm() <= 1.0 + 1e-12);
         assert!(m.s22.norm() <= 1.0 + 1e-12);
+    }
+
+    /// A single interface S-matrix has unit determinant away from its Fresnel
+    /// pole, so its determinant cannot serve as an interface characteristic.
+    #[test]
+    fn single_interface_determinant_is_unity() {
+        let layers = [Layer::from_real(1.45, 1.0), Layer::from_real(2.0, 1.0)];
+        let matrix = calculate_s_matrix_with_bc(
+            &layers,
+            real(2.0),
+            c(2.8, 0.1),
+            Polarization::TM,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert!((matrix.determinant() - real(1.0)).norm() < 1e-12);
+    }
+
+    /// The unsquared TM condition accepts the analytic dielectric-metal SPP on
+    /// the physical sheet and rejects a displaced effective index.
+    #[test]
+    fn tm_interface_characteristic_vanishes_at_spp() {
+        let epsilon_d = real(2.1025);
+        let epsilon_m = c(-116.944, 11.223);
+        let n_d = epsilon_d.sqrt();
+        let n_m = epsilon_m.sqrt();
+        let neff = (epsilon_d * epsilon_m / (epsilon_d + epsilon_m)).sqrt();
+        let k0 = real(2.0 * std::f64::consts::PI / 1.55);
+
+        let at_mode = interface_eigencondition(
+            n_d,
+            n_m,
+            k0,
+            k0 * neff,
+            Polarization::TM,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        let displaced = interface_eigencondition(
+            n_d,
+            n_m,
+            k0,
+            k0 * (neff + real(0.05)),
+            Polarization::TM,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+
+        assert!(at_mode.norm() < 1e-10, "SPP residual is {at_mode}");
+        assert!(displaced.norm() > 1e-3);
+    }
+
+    /// Nonmagnetic dielectric-metal interfaces have no isolated TE surface mode.
+    #[test]
+    fn te_interface_characteristic_is_nonzero_at_tm_spp() {
+        let epsilon_d = real(2.1025);
+        let epsilon_m = c(-116.944, 11.223);
+        let n_d = epsilon_d.sqrt();
+        let n_m = epsilon_m.sqrt();
+        let neff = (epsilon_d * epsilon_m / (epsilon_d + epsilon_m)).sqrt();
+        let k0 = real(2.0 * std::f64::consts::PI / 1.55);
+        let characteristic = interface_eigencondition(
+            n_d,
+            n_m,
+            k0,
+            k0 * neff,
+            Polarization::TE,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert!(characteristic.norm() > 1e-3);
     }
 }

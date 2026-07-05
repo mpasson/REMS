@@ -9,4 +9,5 @@ chapters:
       - file: examples/slab
       - file: examples/sweep
       - file: examples/one_sided_qnm
+      - file: examples/surface_plasmon
   - file: api

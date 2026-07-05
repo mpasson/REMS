@@ -17,7 +17,10 @@ use crate::enums::BoundaryCondition;
 use crate::enums::Normalization;
 use crate::enums::Polarization;
 use crate::layer::{Layer, LayerCoefficientVector, PEC};
-use crate::scattering_matrix::{calculate_s_matrix, calculate_s_matrix_with_bc};
+use crate::scattering_matrix::{
+    calculate_s_matrix, calculate_s_matrix_with_bc, interface_eigencondition,
+    interface_eigencondition_terms,
+};
 use crate::transfer_matrix::TransferMatrix;
 use crate::transfer_matrix::{
     calculate_t_matrix, get_propagation_coefficients_pec_left,
@@ -109,6 +112,15 @@ const MULLER_TOL: f64 = 1e-10;
 
 /// Maximum number of Muller iterations per root.
 const MULLER_MAX_ITER: usize = 200;
+
+/// Maximum relative residual accepted for an exact two-layer interface mode.
+const INTERFACE_RESIDUAL_TOL: f64 = 1e-9;
+
+/// Relative tolerance used to reject the divergent surface-resonance limit.
+const INTERFACE_DENOMINATOR_TOL: f64 = 1e-12;
+
+/// Maximum imaginary part treated as numerical zero by the real-axis interface API.
+const REAL_INTERFACE_IM_TOL: f64 = 1e-10;
 
 // ─── Quadrature helper ────────────────────────────────────────────────────────
 
@@ -417,8 +429,10 @@ impl MultiLayer {
 
     /// Calculates neff of the requested mode.
     ///
-    /// Uses the fast real-axis scan.  For modes in lossy or leaky structures
-    /// use [`python_complex_neff`] instead.
+    /// Uses the fast real-axis scan. A two-layer physical interface instead
+    /// uses its exact TM eigencondition and returns the mode only when its
+    /// effective index is real. For lossy or leaky structures use
+    /// [`python_complex_neff`] instead.
     ///
     /// # Arguments
     /// * `omega`        - The angular frequency of the mode.
@@ -485,21 +499,23 @@ impl MultiLayer {
 
     /// Finds a single complex effective index in the complex neff plane.
     ///
-    /// The boundary conditions used to build the S-matrix are controlled by the
-    /// `left_bc` / `right_bc` arguments (which override the boundary conditions
-    /// stored on the `MultiLayer` object for this call only).
+    /// For exactly two layers, the solver evaluates the exact unsquared
+    /// single-interface eigencondition instead of the S-matrix determinant.
+    /// Omitted ranges do not constrain that analytic candidate; any supplied
+    /// `re_range` or `im_range` filters it independently.
     ///
-    /// | `left_bc`    | `right_bc`   | Mode type                              |
-    /// |--------------|--------------|----------------------------------------|
-    /// | SemiInfinite | SemiInfinite | Guided / lossy guided (`Im ≈ 0`)       |
-    /// | Outgoing     | Outgoing     | Quasi-normal modes (`Im(neff) < 0`)    |
-    /// | SemiInfinite | Outgoing     | One-sided leaky modes (`Im(neff) > 0`) |
+    /// For larger stacks, the boundary conditions used to build the S-matrix are
+    /// controlled by the `left_bc` / `right_bc` arguments (which override the
+    /// boundary conditions stored on the `MultiLayer` object for this call only).
     ///
-    /// The default `im_range` adapts automatically to the active boundary conditions:
-    /// - `SemiInfinite` + `SemiInfinite` → near-real window (symmetric for lossy, slightly
-    ///   asymmetric for lossless).
-    /// - `Outgoing` + `Outgoing` → lower half-plane `(-0.15, -1e-3)` for QNMs.
-    /// - One `Outgoing` → upper half-plane `(1e-3, 0.15)` for leaky modes.
+    /// Boundary-condition combinations select the mode type:
+    /// - `SemiInfinite` / `SemiInfinite`: guided or lossy guided modes.
+    /// - `Outgoing` / `Outgoing`: quasi-normal modes with `Im(neff) < 0`.
+    /// - One `Outgoing` boundary: one-sided leaky modes with `Im(neff) > 0`.
+    ///
+    /// The default `im_range` is near-real for two `SemiInfinite`
+    /// boundaries, lower-half-plane for two `Outgoing` boundaries, and
+    /// upper-half-plane when exactly one boundary is `Outgoing`.
     ///
     /// # Arguments
     /// * `omega`        - The angular frequency (real).
@@ -535,8 +551,9 @@ impl MultiLayer {
 
     /// Returns all complex effective indices found in the search rectangle.
     ///
-    /// Same boundary-condition logic as [`complex_neff`].  See that method's
-    /// documentation for the `left_bc` / `right_bc` parameter description.
+    /// Same exact two-layer behavior and boundary-condition logic as
+    /// [`complex_neff`]. See that method's documentation for range filtering
+    /// and the `left_bc` / `right_bc` parameter description.
     ///
     /// # Arguments
     /// * `omega`        - The angular frequency (real).
@@ -580,10 +597,10 @@ impl MultiLayer {
     /// ([`python_complex_neff`]) to find the effective index, then reconstructs the
     /// field for that mode.
     ///
-    /// For semi-infinite boundaries the outgoing wave in the rightmost layer is
-    /// **not** zeroed: for a complex neff the radiation condition is already encoded
-    /// in the imaginary part, and zeroing the outgoing amplitude would give a
-    /// physically wrong result.
+    /// A physical two-layer TM interface uses the exact closed-form field,
+    /// enforcing continuity of `Hy` and `epsilon * Ez`. Other structures use
+    /// the existing TMM coefficient reconstruction; their radiation behavior is
+    /// encoded in the complex effective index.
     ///
     /// # Arguments
     /// * `omega`        - The angular frequency (real).
@@ -758,6 +775,92 @@ impl MultiLayer {
         find_minmax_n(&self.layers)
     }
 
+    /// Solves the exact eigencondition for a structure containing one interface.
+    ///
+    /// The squared TM dispersion provides a candidate only. The candidate is
+    /// canonicalized to positive propagation and then checked against the
+    /// unsquared eigencondition on the boundary-condition-selected kz sheets.
+    fn solve_two_layer_interface(
+        &self,
+        k0: f64,
+        polarization: Polarization,
+        left_bc: BoundaryCondition,
+        right_bc: BoundaryCondition,
+    ) -> Option<Complex<f64>> {
+        debug_assert_eq!(self.layers.len(), 2);
+        if !matches!(polarization, Polarization::TM) || !k0.is_finite() || k0.abs() <= f64::EPSILON
+        {
+            return None;
+        }
+
+        let epsilon_left = self.layers[0].n.powi(2);
+        let epsilon_right = self.layers[1].n.powi(2);
+        let finite = |value: Complex<f64>| value.re.is_finite() && value.im.is_finite();
+        if !finite(epsilon_left) || !finite(epsilon_right) {
+            return None;
+        }
+
+        let material_scale = epsilon_left.norm().max(epsilon_right.norm()).max(1.0);
+        if (epsilon_left - epsilon_right).norm() <= INTERFACE_DENOMINATOR_TOL * material_scale {
+            return None;
+        }
+
+        let denominator = epsilon_left + epsilon_right;
+        let denominator_scale = epsilon_left.norm() + epsilon_right.norm();
+        if denominator_scale == 0.0
+            || denominator.norm() <= INTERFACE_DENOMINATOR_TOL * denominator_scale
+        {
+            return None;
+        }
+
+        let neff_squared = epsilon_left * epsilon_right / denominator;
+        if !finite(neff_squared) {
+            return None;
+        }
+
+        let mut neff = neff_squared.sqrt();
+        if !finite(neff) {
+            return None;
+        }
+
+        // The squared dispersion produces the reciprocal pair +/-neff. Keep the
+        // positive-propagation representative; for a purely imaginary pair use
+        // nonnegative Im(neff) as the deterministic tie-breaker.
+        if neff.re < 0.0 || (neff.re.abs() <= f64::EPSILON && neff.im < 0.0) {
+            neff = -neff;
+        }
+
+        let k0_complex = Complex::new(k0, 0.0);
+        let (term_left, term_right) = interface_eigencondition_terms(
+            self.layers[0].n,
+            self.layers[1].n,
+            k0_complex,
+            k0_complex * neff,
+            polarization,
+            left_bc,
+            right_bc,
+        );
+        let residual_scale = term_left.norm() + term_right.norm();
+        if !residual_scale.is_finite() || residual_scale <= f64::MIN_POSITIVE {
+            return None;
+        }
+        let characteristic = interface_eigencondition(
+            self.layers[0].n,
+            self.layers[1].n,
+            k0_complex,
+            k0_complex * neff,
+            polarization,
+            left_bc,
+            right_bc,
+        );
+        let residual = characteristic.norm() / residual_scale;
+        if !residual.is_finite() || residual > INTERFACE_RESIDUAL_TOL {
+            return None;
+        }
+
+        Some(neff)
+    }
+
     /// Single step of the real-axis peak-finding process.
     fn solve_step(
         &self,
@@ -792,6 +895,25 @@ impl MultiLayer {
     /// # Returns
     /// The effective indices of the modes, sorted descending.
     pub fn solve(&self, k0: f64, polarization: Polarization) -> Vec<f64> {
+        // PEC half-slabs retain the existing real-axis TMM path. A literal
+        // two-medium interface uses the exact physical-sheet condition and is
+        // independent of the selected backend.
+        if self.layers.len() == 2
+            && !matches!(self.left_bc, BoundaryCondition::PEC)
+            && !matches!(self.right_bc, BoundaryCondition::PEC)
+        {
+            return self
+                .solve_two_layer_interface(
+                    k0,
+                    polarization,
+                    BoundaryCondition::SemiInfinite,
+                    BoundaryCondition::SemiInfinite,
+                )
+                .filter(|neff| neff.im.abs() <= REAL_INTERFACE_IM_TOL)
+                .map(|neff| vec![neff.re])
+                .unwrap_or_default();
+        }
+
         let (min_n, max_n) = self.find_minmax_n();
         let k_min = k0 * min_n + 1e-9;
         let k_max = k0 * max_n - 1e-9;
@@ -1578,6 +1700,23 @@ impl MultiLayer {
         left_bc: BoundaryCondition,
         right_bc: BoundaryCondition,
     ) -> Vec<Complex<f64>> {
+        if self.layers.len() == 2 {
+            return self
+                .solve_two_layer_interface(k0, polarization, left_bc, right_bc)
+                .filter(|neff| {
+                    re_range
+                        .map(|(min, max)| neff.re >= min && neff.re <= max)
+                        .unwrap_or(true)
+                })
+                .filter(|neff| {
+                    im_range
+                        .map(|(min, max)| neff.im >= min && neff.im <= max)
+                        .unwrap_or(true)
+                })
+                .into_iter()
+                .collect();
+        }
+
         // Adaptive path: no explicit ranges supplied.
         let (re_range, im_range) =
             match self.default_search_ranges_for_bc(re_range, im_range, left_bc, right_bc) {
@@ -1785,6 +1924,65 @@ impl MultiLayer {
 
     // ── Field reconstruction ──────────────────────────────────────────────────
 
+    /// Reconstructs the closed-form TM field of a physical two-medium interface.
+    ///
+    /// The magnetic envelope is continuous at the interface. Maxwell's
+    /// relations then give `epsilon * Ez = -neff * Hy * Z0`, so the normal
+    /// displacement is continuous while `Ez` itself is discontinuous.
+    fn field_two_layer_tm(&self, k0: f64, neff: Complex<f64>) -> FieldData {
+        use crate::transfer_matrix::kz_physical;
+
+        let grid_data = self.get_grid_data();
+        let k0_complex = Complex::new(k0, 0.0);
+        let k = k0_complex * neff;
+        let mut ex = Vec::with_capacity(grid_data.xplot.len());
+        let mut ez = Vec::with_capacity(grid_data.xplot.len());
+        let mut hy = Vec::with_capacity(grid_data.xplot.len());
+
+        for &x in &grid_data.xplot {
+            let (layer, normal_kz, phase) = if x < 0.0 {
+                let layer = &self.layers[0];
+                let kz = kz_physical(k0_complex, layer.n, k);
+                (layer, -kz, (Complex::new(0.0, -x) * kz).exp())
+            } else {
+                let layer = &self.layers[1];
+                let kz = kz_physical(k0_complex, layer.n, k);
+                (layer, kz, (Complex::new(0.0, x) * kz).exp())
+            };
+            let epsilon = layer.n.powi(2);
+            ex.push(normal_kz * phase / (k0_complex * epsilon));
+            ez.push(-neff * phase / epsilon);
+            hy.push(phase / Z0);
+        }
+
+        let zeros = vec![Complex::new(0.0, 0.0); grid_data.xplot.len()];
+        let field_data = FieldData {
+            x: grid_data.xplot,
+            Ex: ex,
+            Ey: zeros.clone(),
+            Ez: ez,
+            Hx: zeros.clone(),
+            Hy: hy,
+            Hz: zeros,
+        };
+
+        let normalization = if neff.im != 0.0 && matches!(self.normalization, Normalization::Power)
+        {
+            warn!(
+                "Power normalization is not valid for complex neff (neff = {:.6} + {:.6}i). \
+                 Falling back to MaxField normalization.",
+                neff.re, neff.im
+            );
+            Normalization::MaxField
+        } else {
+            self.normalization
+        };
+        match normalization {
+            Normalization::MaxField => field_data.normalize_max_field(),
+            Normalization::Power => field_data.normalize_power(),
+        }
+    }
+
     /// Calculates the field profile of the requested mode.
     pub fn field(
         &self,
@@ -1796,6 +1994,14 @@ impl MultiLayer {
             Ok(n) => n,
             Err(e) => return Err(e),
         };
+
+        if self.layers.len() == 2
+            && matches!(polarization, Polarization::TM)
+            && matches!(self.left_bc, BoundaryCondition::SemiInfinite)
+            && matches!(self.right_bc, BoundaryCondition::SemiInfinite)
+        {
+            return Ok(self.field_two_layer_tm(k0, Complex::new(neff, 0.0)));
+        }
 
         let (init_a, init_b) = match self.left_bc {
             BoundaryCondition::SemiInfinite | BoundaryCondition::Outgoing => {
@@ -1891,6 +2097,14 @@ impl MultiLayer {
         polarization: Polarization,
         neff: Complex<f64>,
     ) -> FieldData {
+        if self.layers.len() == 2
+            && matches!(polarization, Polarization::TM)
+            && matches!(self.left_bc, BoundaryCondition::SemiInfinite)
+            && matches!(self.right_bc, BoundaryCondition::SemiInfinite)
+        {
+            return self.field_two_layer_tm(k0, neff);
+        }
+
         let k = neff * k0;
 
         let (init_a, init_b) = match self.left_bc {
@@ -1900,12 +2114,24 @@ impl MultiLayer {
             BoundaryCondition::PEC => (Complex::new(1.0, 0.0), Complex::new(-1.0, 0.0)),
         };
 
-        let coefficient_vector =
+        let mut coefficient_vector =
             self.get_propagation_coefficients(k0, k, polarization, init_a, init_b);
         let grid_data = self.get_grid_data();
 
-        // NOTE: for complex neff we do NOT zero the outgoing amplitude in the
-        // last layer. The correct boundary behaviour is encoded in Im(neff).
+        // For an exact two-layer bound mode, the right-cladding coefficient
+        // that grows toward +x is analytically zero. Roundoff at the interface
+        // can leave a machine-sized value that is exponentially amplified over
+        // a lossy-metal plotting window, so enforce the SemiInfinite boundary
+        // explicitly. The general multilayer and Outgoing paths are unchanged.
+        if self.layers.len() == 2 && matches!(self.right_bc, BoundaryCondition::SemiInfinite) {
+            if let Some(last) = coefficient_vector.last_mut() {
+                last.b = Complex::new(0.0, 0.0);
+            }
+        }
+
+        // Outside that exact two-layer case, complex-neff reconstruction keeps
+        // the propagated amplitudes unchanged; radiation behavior is encoded in
+        // the complex effective index.
 
         let coefficients = self.get_coefficient_all_components(k0, k, coefficient_vector);
         let (main1, main2, main3, maink, mainb, zeros) = coefficients;
@@ -3102,5 +3328,183 @@ mod tests {
             "Re(neff) should be ≈ 1.8043"
         );
         assert!(mode.im.abs() < 1e-10, "Im(neff) should be 0 for lossless");
+    }
+
+    // -- Exact two-layer interface solver tests --------------------------------
+
+    fn create_gold_like_interface() -> (MultiLayer, Complex<f64>, f64) {
+        let epsilon_d = Complex::new(2.1025, 0.0);
+        let epsilon_m = Complex::new(-116.944, 11.223);
+        let expected = (epsilon_d * epsilon_m / (epsilon_d + epsilon_m)).sqrt();
+        let multilayer = MultiLayer::new(vec![
+            Layer::from_complex(epsilon_d.sqrt(), 2.0),
+            Layer::from_complex(epsilon_m.sqrt(), 2.0),
+        ]);
+        (multilayer, expected, 2.0 * PI / 1.55)
+    }
+
+    #[test]
+    fn test_two_layer_complex_solver_and_range_filtering() {
+        let (interface, expected, k0) = create_gold_like_interface();
+        let automatic = interface.solve_complex(
+            k0,
+            Polarization::TM,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert_eq!(automatic.len(), 1);
+        assert!((automatic[0] - expected).norm() < 1e-10);
+
+        let included = interface.solve_complex(
+            k0,
+            Polarization::TM,
+            Some((1.4, 1.5)),
+            Some((0.0, 0.01)),
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert_eq!(included.len(), 1);
+
+        for (re_range, im_range) in [(Some((1.0, 1.4)), None), (None, Some((-0.01, 0.0)))] {
+            assert!(interface
+                .solve_complex(
+                    k0,
+                    Polarization::TM,
+                    re_range,
+                    im_range,
+                    BoundaryCondition::SemiInfinite,
+                    BoundaryCondition::SemiInfinite,
+                )
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn test_two_layer_interface_order_and_polarization() {
+        let (interface, expected, k0) = create_gold_like_interface();
+        let reversed = MultiLayer::new(vec![
+            Layer::from_complex(interface.layers[1].n, 2.0),
+            Layer::from_complex(interface.layers[0].n, 2.0),
+        ]);
+        let reversed_modes = reversed.solve_complex(
+            k0,
+            Polarization::TM,
+            None,
+            None,
+            BoundaryCondition::SemiInfinite,
+            BoundaryCondition::SemiInfinite,
+        );
+        assert_eq!(reversed_modes.len(), 1);
+        assert!((reversed_modes[0] - expected).norm() < 1e-10);
+
+        assert!(interface
+            .solve_complex(
+                k0,
+                Polarization::TE,
+                None,
+                None,
+                BoundaryCondition::SemiInfinite,
+                BoundaryCondition::SemiInfinite,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn test_two_layer_rejects_nondiscrete_and_divergent_cases() {
+        let k0 = 2.0 * PI / 1.55;
+        for interface in [
+            MultiLayer::new(vec![
+                Layer::from_real(1.45, 1.0),
+                Layer::from_real(1.7, 1.0),
+            ]),
+            MultiLayer::new(vec![
+                Layer::from_real(1.45, 1.0),
+                Layer::from_real(1.45, 1.0),
+            ]),
+            MultiLayer::new(vec![
+                Layer::from_complex(Complex::new(2.0_f64.sqrt(), 0.0), 1.0),
+                Layer::from_complex(Complex::new(0.0, 2.0_f64.sqrt()), 1.0),
+            ]),
+        ] {
+            assert!(interface
+                .solve_complex(
+                    k0,
+                    Polarization::TM,
+                    None,
+                    None,
+                    BoundaryCondition::SemiInfinite,
+                    BoundaryCondition::SemiInfinite,
+                )
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn test_two_layer_real_axis_parity() {
+        let epsilon_d = Complex::new(2.25, 0.0);
+        let epsilon_m = Complex::new(-10.0, 0.0);
+        let expected = (epsilon_d * epsilon_m / (epsilon_d + epsilon_m)).sqrt().re;
+        let mut interface = MultiLayer::new(vec![
+            Layer::from_complex(epsilon_d.sqrt(), 1.0),
+            Layer::from_complex(epsilon_m.sqrt(), 1.0),
+        ]);
+        let k0 = 2.0 * PI / 1.55;
+
+        assert_vec_approx_equal(&interface.solve(k0, Polarization::TM), &[expected], 1e-10);
+        assert!(interface.solve(k0, Polarization::TE).is_empty());
+
+        interface.set_backend(BackEnd::Scattering);
+        assert_vec_approx_equal(&interface.solve(k0, Polarization::TM), &[expected], 1e-10);
+    }
+
+    #[test]
+    fn test_two_layer_complex_field_is_localized_and_continuous() {
+        let (interface, expected, k0) = create_gold_like_interface();
+        let field = interface.field_complex(k0, Polarization::TM, expected);
+
+        for component in [
+            &field.Ex, &field.Ey, &field.Ez, &field.Hx, &field.Hy, &field.Hz,
+        ] {
+            assert!(component
+                .iter()
+                .all(|value| value.re.is_finite() && value.im.is_finite()));
+        }
+
+        let electric_magnitude = |index: usize| {
+            (field.Ex[index].norm_sqr() + field.Ey[index].norm_sqr() + field.Ez[index].norm_sqr())
+                .sqrt()
+        };
+        let max_e = (0..field.x.len())
+            .map(electric_magnitude)
+            .fold(0.0_f64, f64::max);
+        assert!((max_e - 1.0).abs() < 1e-10);
+        assert!(electric_magnitude(0) < 0.3);
+        assert!(electric_magnitude(field.x.len() - 1) < 0.3);
+
+        for component in [&field.Ey, &field.Hx, &field.Hz] {
+            assert!(component.iter().all(|value| value.norm() < 1e-14));
+        }
+
+        let right = field
+            .x
+            .iter()
+            .position(|x| *x >= 0.0)
+            .expect("two-layer grid must contain the interface");
+        let left = right - 1;
+        let relative_difference = |a: Complex<f64>, b: Complex<f64>| {
+            (a - b).norm() / (a.norm() + b.norm()).max(f64::MIN_POSITIVE)
+        };
+        assert!(relative_difference(field.Hy[left], field.Hy[right]) < 0.01);
+
+        let epsilon_left = interface.layers[0].n.powi(2);
+        let epsilon_right = interface.layers[1].n.powi(2);
+        assert!(
+            relative_difference(
+                epsilon_left * field.Ez[left],
+                epsilon_right * field.Ez[right],
+            ) < 0.01
+        );
     }
 }
